@@ -6,6 +6,21 @@ A desktop application for translating **EPUB**, **SRT**, and **TXT** files using
 
 ---
 
+## Screenshots .epub before and after:
+
+<details>
+<summary>Click to expand</summary>
+
+<br>
+
+<img width="802" height="1020" alt="en" src="https://github.com/user-attachments/assets/2529761d-3765-41de-a872-bad7266877d7" />
+<br>
+<img width="799" height="1017" alt="pl" src="https://github.com/user-attachments/assets/5f849c44-4dcc-4493-a8a5-f89990fa4ed2" />
+
+</details>
+
+---
+
 ## Supported formats
 
 | Format | Notes |
