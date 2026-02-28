@@ -196,26 +196,93 @@ torch
 
 ## Installation
 
+### Windows
+
+1. Install **Python 3.10+** from [python.org](https://www.python.org/downloads/) — check *"Add Python to PATH"* during setup.
+
+2. Clone the repository:
+   ```bat
+   git clone https://github.com/Mubumbutu/EPUB-SRT-LLM-Translator.git
+   cd EPUB-SRT-LLM-Translator
+   ```
+
+3. Run `install.bat`. The installer will:
+   - Create a virtual environment in `venv/`
+   - Detect whether an NVIDIA GPU is present and which CUDA version the driver supports
+   - Ask whether to install the CPU or GPU (CUDA) variant of PyTorch
+   - Install all dependencies from `requirements.txt`
+   - Verify the installation
+
+   CUDA version is selected automatically based on the detected driver:
+
+   | Driver version | CUDA |
+   |----------------|------|
+   | ≥ 550 | CUDA 12.4 |
+   | ≥ 525 | CUDA 12.1 |
+   | ≥ 450 | CUDA 11.8 |
+   | < 450 | CPU fallback |
+
+4. **Run:** double-click `launcher.vbs` — starts the application from the virtual environment without a console window.
+
+---
+
+### Linux
+
 ```bash
 git clone https://github.com/Mubumbutu/EPUB-SRT-LLM-Translator.git
 cd EPUB-SRT-LLM-Translator
+
+python3 -m venv venv
+source venv/bin/activate
+
 pip install -r requirements.txt
+
+# CPU (always works):
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# GPU — check your driver version with: nvidia-smi
+# CUDA 12.4 (driver ≥ 550):
+# pip install torch --index-url https://download.pytorch.org/whl/cu124
+# CUDA 12.1 (driver ≥ 525):
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+# CUDA 11.8 (driver ≥ 450):
+# pip install torch --index-url https://download.pytorch.org/whl/cu118
 ```
 
-With CUDA support for alignment (optional):
+Run:
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+source venv/bin/activate
+python app.py
 ```
 
 ---
 
-## Running
+### macOS
 
 ```bash
+git clone https://github.com/Mubumbutu/EPUB-SRT-LLM-Translator.git
+cd EPUB-SRT-LLM-Translator
+
+python3 -m venv venv
+source venv/bin/activate
+
+pip install -r requirements.txt
+pip install torch
+```
+
+> **Note:** CUDA is not available on macOS. Tag alignment (EPUB Legacy mode) will run on CPU only, which is noticeably slower for large files. Apple Silicon (M1/M2/M3) is not explicitly configured for MPS acceleration.
+
+Run:
+```bash
+source venv/bin/activate
 python app.py
 ```
 
-Make sure your chosen LLM backend is running before starting a translation session.
+---
+
+> `torch` and `transformers` are required **only** for tag alignment in EPUB Legacy mode. The rest of the application works without them.
+
+Make sure your chosen LLM backend (LM Studio / Ollama) is running before starting a translation session.
 
 ---
 
