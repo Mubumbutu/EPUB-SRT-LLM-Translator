@@ -57,13 +57,16 @@ Quick translation supports single fragments or all checked fragments in bulk. A 
 
 EPUB files contain HTML with inline formatting tags (`<i>`, `<b>`, `<span>`, `<em>`, `<strong>`, `<u>`, `<sup>`, `<sub>`, `<small>`) that should not be sent to an LLM as raw HTML. The application replaces them with numbered placeholders before translation and restores them afterward.
 
-### Inline mode (default)
+### Inline mode (recommended for larger LLMs)
 
 All inline formatting tags are replaced with paired placeholders: `<p_01>...</p_01>`, `<p_02>...</p_02>`, etc.  
 Non-translatable content (padding spaces, empty anchors) is marked as `<nt_01/>`.  
 Structural elements (`img`, `code`, `br`, `hr`, `kbd`, `abbr`, `wbr`, `var`, `canvas`, `svg`, `script`, `style`, `math`) become `<id_01>` reserve markers.
 
 After translation, placeholders are resolved back to the original tags in their correct positions.
+
+This mode relies on the model correctly preserving structured placeholder tokens.
+It works best with larger, instruction-following LLMs that can reliably handle synthetic markers in the text. Smaller or lightweight models may occasionally drop, duplicate, or reorder placeholders.
 
 ### Legacy mode
 
