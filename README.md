@@ -1,6 +1,6 @@
 # EPUB and SRT Translator with LLM
 
-A desktop application for translating **EPUB**, **SRT**, and **TXT** files using local or cloud-hosted language models. Written in Python with a PyQt6 interface.
+A desktop application for translating **EPUB**, **SRT**, and **TXT** files using local or cloud-hosted language models.
 
 <img width="1504" height="936" alt="translator" src="https://github.com/user-attachments/assets/8c0dac5b-82f8-46eb-afa9-c61f7d6831bb" />
 
