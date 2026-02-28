@@ -1,0 +1,8 @@
+PyQt6>=6.4.0
+lxml>=4.9.0
+ebooklib>=0.18
+requests>=2.28.0
+openrouter
+deep-translator
+deepl
+transformers>=4.35.0
