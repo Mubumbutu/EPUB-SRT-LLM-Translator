@@ -4,6 +4,7 @@ import logging
 import re
 import requests
 import time
+import threading
 from abc import ABC, abstractmethod
 from openrouter import OpenRouter
 from openrouter.errors.chaterror import ChatError
@@ -24,7 +25,19 @@ class LLMClient(ABC):
 class LMStudioClient(LLMClient):
     def __init__(self, endpoint: str = "http://localhost:1234/v1/chat/completions"):
         self.endpoint = endpoint
+        self._active_session = None
+        self._session_lock = threading.Lock()
         logger.info(f"Initialized LM Studio client: {endpoint}")
+
+    def abort(self):
+        with self._session_lock:
+            if self._active_session is not None:
+                try:
+                    self._active_session.close()
+                    logger.info("LMStudioClient: sesja zamknięta (hard cancel)")
+                except Exception as e:
+                    logger.warning(f"LMStudioClient: błąd zamykania sesji: {e}")
+                self._active_session = None
 
     def translate(
         self,
@@ -38,28 +51,26 @@ class LMStudioClient(LLMClient):
             "max_tokens": -1,
             "stream": False
         }
-
         headers = {"Content-Type": "application/json"}
+
+        session = requests.Session()
+        with self._session_lock:
+            self._active_session = session
 
         try:
             logger.debug(f"LM Studio request: temp={temperature}, timeout={timeout_seconds}s")
-
-            response = requests.post(
+            response = session.post(
                 self.endpoint,
                 json=payload,
                 headers=headers,
                 timeout=timeout_seconds
             )
-
             response.raise_for_status()
             data = response.json()
-
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
             if not content:
                 logger.warning("LM Studio returned empty content")
                 return ""
-
             logger.debug(f"LM Studio response: {len(content)} chars")
             return content
 
@@ -71,6 +82,11 @@ class LMStudioClient(LLMClient):
             logger.error(f"LM Studio request failed: {e}")
             raise
 
+        finally:
+            with self._session_lock:
+                if self._active_session is session:
+                    self._active_session = None
+
 class OllamaClient(LLMClient):
     def __init__(
         self,
@@ -80,7 +96,19 @@ class OllamaClient(LLMClient):
         self.model_name = model_name
         self.endpoint = endpoint
         self.api_url = f"{endpoint}/api/generate"
+        self._active_session = None
+        self._session_lock = threading.Lock()
         logger.info(f"Initialized Ollama client: {endpoint} (model: {model_name})")
+
+    def abort(self):
+        with self._session_lock:
+            if self._active_session is not None:
+                try:
+                    self._active_session.close()
+                    logger.info("OllamaClient: sesja zamknięta (hard cancel)")
+                except Exception as e:
+                    logger.warning(f"OllamaClient: błąd zamykania sesji: {e}")
+                self._active_session = None
 
     def translate(
         self,
@@ -94,28 +122,26 @@ class OllamaClient(LLMClient):
             "temperature": temperature,
             "stream": False
         }
-
         headers = {"Content-Type": "application/json"}
+
+        session = requests.Session()
+        with self._session_lock:
+            self._active_session = session
 
         try:
             logger.debug(f"Ollama request: model={self.model_name}, temp={temperature}, timeout={timeout_seconds}s")
-
-            response = requests.post(
+            response = session.post(
                 self.api_url,
                 json=payload,
                 headers=headers,
                 timeout=timeout_seconds
             )
-
             response.raise_for_status()
             data = response.json()
-
             content = data.get("response", "")
-
             if not content:
                 logger.warning("Ollama returned empty response")
                 return ""
-
             logger.debug(f"Ollama response: {len(content)} chars")
             return content
 
@@ -126,6 +152,11 @@ class OllamaClient(LLMClient):
         except requests.RequestException as e:
             logger.error(f"Ollama request failed: {e}")
             raise
+
+        finally:
+            with self._session_lock:
+                if self._active_session is session:
+                    self._active_session = None
 
 class OpenRouterClient(LLMClient):
     def __init__(self, api_key: str, model_name: str):
@@ -1001,6 +1032,12 @@ class TranslationOrchestrator:
     def cancel(self):
         self._cancelled = True
         logger.info("TranslationOrchestrator: cancellation requested")
+
+    def hard_cancel(self):
+        self._cancelled = True
+        logger.info("TranslationOrchestrator: HARD CANCEL requested")
+        if hasattr(self.llm_client, 'abort'):
+            self.llm_client.abort()
 
     def _log_prompt_details(
         self,
