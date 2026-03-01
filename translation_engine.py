@@ -162,16 +162,30 @@ class OpenRouterClient(LLMClient):
     def __init__(self, api_key: str, model_name: str):
         self.api_key = api_key
         self.model_name = model_name
+        self.endpoint = "https://openrouter.ai/api/v1/chat/completions"
 
         self.is_free_model = model_name.strip().endswith(":free")
 
         self._last_request_time: Optional[float] = None
         self._min_interval = 5.0
 
+        self._active_session = None
+        self._session_lock = threading.Lock()
+
         logger.info(
             f"Initialized OpenRouter client (model: {model_name}, "
             f"free_model: {self.is_free_model})"
         )
+
+    def abort(self):
+        with self._session_lock:
+            if self._active_session is not None:
+                try:
+                    self._active_session.close()
+                    logger.info("OpenRouterClient: sesja zamknięta (hard cancel)")
+                except Exception as e:
+                    logger.warning(f"OpenRouterClient: błąd zamykania sesji: {e}")
+                self._active_session = None
 
     def _wait_for_rate_limit(self):
         if not self.is_free_model:
@@ -188,25 +202,10 @@ class OpenRouterClient(LLMClient):
                 )
                 time.sleep(wait_needed)
 
-    def _is_rate_limit_error(self, e: Exception) -> bool:
-        try:
-            if isinstance(e, ChatError):
-                if hasattr(e, 'http_res') and e.http_res is not None:
-                    if e.http_res.status_code == 429:
-                        return True
-
-                if hasattr(e, 'raw_response') and e.raw_response is not None:
-                    try:
-                        if e.raw_response.status_code == 429:
-                            return True
-                    except Exception:
-                        pass
-        except ImportError:
-            pass
-
-        err_str = str(e)
+    def _is_rate_limit_error(self, status_code: int, err_str: str) -> bool:
         return (
-            "429" in err_str
+            status_code == 429
+            or "429" in err_str
             or "too many requests" in err_str.lower()
             or "rate limit" in err_str.lower()
             or "ratelimit" in err_str.lower()
@@ -219,38 +218,80 @@ class OpenRouterClient(LLMClient):
         timeout_seconds: int,
         max_retries: int = 5
     ) -> str:
-        try:
-            pass
-        except ImportError:
-            raise ImportError(
-                "openrouter package is not installed.\n"
-                "Run: pip install openrouter"
-            )
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {
+            "model": self.model_name,
+            "messages": prompt,
+            "temperature": temperature,
+        }
 
         for attempt in range(1, max_retries + 1):
             self._wait_for_rate_limit()
-
             self._last_request_time = time.time()
+
+            session = requests.Session()
+            with self._session_lock:
+                self._active_session = session
 
             try:
                 logger.debug(
-                    f"OpenRouter SDK request (attempt {attempt}/{max_retries}): "
+                    f"OpenRouter request (attempt {attempt}/{max_retries}): "
                     f"model={self.model_name}, temp={temperature}, "
                     f"timeout={timeout_seconds}s, free={self.is_free_model}"
                 )
 
-                with OpenRouter(api_key=self.api_key) as client:
-                    response = client.chat.send(
-                        model=self.model_name,
-                        messages=prompt,
-                        temperature=temperature
-                    )
+                response = session.post(
+                    self.endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout_seconds
+                )
 
-                if not response.choices:
-                    logger.warning("OpenRouter returned no choices")
-                    return ""
+                status_code = response.status_code
+                err_str = ""
 
-                content = response.choices[0].message.content
+                if status_code != 200:
+                    try:
+                        err_str = response.text
+                    except Exception:
+                        err_str = f"HTTP {status_code}"
+
+                    if self._is_rate_limit_error(status_code, err_str):
+                        wait_seconds = min(10.0 * attempt, 120.0)
+                        if attempt < max_retries:
+                            logger.warning(
+                                f"[OpenRouter] Rate limited 429 "
+                                f"(attempt {attempt}/{max_retries}). "
+                                f"Waiting {wait_seconds:.0f}s before retry..."
+                            )
+                            time.sleep(wait_seconds)
+                            continue
+                        else:
+                            raise Exception(
+                                f"OpenRouter rate limit exceeded after {max_retries} attempts"
+                            )
+
+                    if status_code == 404 or "not found" in err_str.lower():
+                        raise Exception(
+                            f"OpenRouter model not found: '{self.model_name}'\n"
+                            f"Check the model name at openrouter.ai/models\n"
+                            f"Details: {err_str}"
+                        )
+
+                    if status_code in (401, 403) or "unauthorized" in err_str.lower() or "invalid api key" in err_str.lower():
+                        raise Exception(
+                            f"OpenRouter authentication error.\n"
+                            f"Check your API key in Options tab.\n"
+                            f"Details: {err_str}"
+                        )
+
+                    raise Exception(f"OpenRouter HTTP {status_code}: {err_str}")
+
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
                 if not content:
                     logger.warning("OpenRouter returned empty content")
@@ -259,72 +300,20 @@ class OpenRouterClient(LLMClient):
                 logger.debug(f"OpenRouter response: {len(content)} chars")
                 return content
 
-            except Exception as e:
-                err_str = str(e)
-
-                if self._is_rate_limit_error(e):
-                    self._last_request_time = time.time()
-
-                    wait_seconds = min(10.0 * attempt, 120.0)
-
-                    if attempt < max_retries:
-                        logger.warning(
-                            f"[OpenRouter] Rate limited 429 "
-                            f"(attempt {attempt}/{max_retries}). "
-                            f"Waiting {wait_seconds:.0f}s before retry..."
-                        )
-                        time.sleep(wait_seconds)
-                        continue
-                    else:
-                        logger.error(
-                            f"[OpenRouter] Rate limited - "
-                            f"max retries ({max_retries}) reached. Giving up."
-                        )
-                        raise Exception(
-                            f"OpenRouter rate limit exceeded after {max_retries} attempts"
-                        )
-
-                is_timeout = (
-                    "timeout" in err_str.lower()
-                    or "timed out" in err_str.lower()
+            except requests.Timeout:
+                logger.error(f"OpenRouter timeout after {timeout_seconds}s")
+                raise TimeoutError(
+                    f"OpenRouter request timed out after {timeout_seconds}s"
                 )
 
-                if is_timeout:
-                    logger.error(f"OpenRouter timeout after {timeout_seconds}s")
-                    raise TimeoutError(
-                        f"OpenRouter request timed out after {timeout_seconds}s"
-                    )
+            except requests.RequestException as e:
+                logger.error(f"OpenRouter request failed: {e}")
+                raise Exception(f"OpenRouter error: {e}")
 
-                is_not_found = (
-                    "404" in err_str
-                    or "not found" in err_str.lower()
-                    or ("model" in err_str.lower() and "not" in err_str.lower())
-                )
-
-                if is_not_found:
-                    raise Exception(
-                        f"OpenRouter model not found: '{self.model_name}'\n"
-                        f"Check the model name at openrouter.ai/models\n"
-                        f"Details: {err_str}"
-                    )
-
-                is_auth_error = (
-                    "401" in err_str
-                    or "403" in err_str
-                    or "unauthorized" in err_str.lower()
-                    or "forbidden" in err_str.lower()
-                    or "invalid api key" in err_str.lower()
-                )
-
-                if is_auth_error:
-                    raise Exception(
-                        f"OpenRouter authentication error.\n"
-                        f"Check your API key in Options tab.\n"
-                        f"Details: {err_str}"
-                    )
-
-                logger.error(f"OpenRouter request failed: {err_str}")
-                raise Exception(f"OpenRouter error: {err_str}")
+            finally:
+                with self._session_lock:
+                    if self._active_session is session:
+                        self._active_session = None
 
         raise Exception(f"OpenRouter: all {max_retries} attempts failed")
 
@@ -1557,3 +1546,4 @@ def build_context_section(
         return "\n\n".join(texts)
 
     return build_text(context_before), build_text(context_after)
+
