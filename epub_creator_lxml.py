@@ -1525,14 +1525,21 @@ class EPUBCreatorLxml(QThread):
                     element.text = translation
                 return
 
-            element.text = translation
-
-            for node, location, _, _, _ in original_texts:
-                if node is element and location == 'text':
-                    continue
-                self._set_text_at_location(node, location, '')
-
-            logger.debug(f"Mapped to element.text: {repr(translation[:50])}")
+            if el is element and loc == 'text':
+                element.text = translation
+                for node, location, _, _, _ in original_texts:
+                    if node is element and location == 'text':
+                        continue
+                    self._set_text_at_location(node, location, '')
+                logger.debug(f"Mapped to element.text: {repr(translation[:50])}")
+            else:
+                element.text = ''
+                self._set_text_at_location(el, loc, translation)
+                for node, location, _, _, _ in original_texts:
+                    if node is el and location == loc:
+                        continue
+                    self._set_text_at_location(node, location, '')
+                logger.debug(f"Mapped to <{tag}>.{loc}: {repr(translation[:50])}")
             return
 
         formatting_elements = self._find_formatting_elements(element)
@@ -2818,3 +2825,4 @@ class EPUBCreatorLxml(QThread):
 
     def _create_side_by_side_table(self, original, translation, root):
         pass
+
