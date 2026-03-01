@@ -111,6 +111,14 @@ class TranslationWorkerThread(QThread):
         if self.orchestrator:
             self.orchestrator.cancel()
 
+    def hard_cancel(self):
+        self._cancelled = True
+        if self.orchestrator:
+            self.orchestrator.hard_cancel()
+        if self.isRunning():
+            self.terminate()
+            logging.info("TranslationWorkerThread: wątek terminowany (hard cancel)")
+
     def _on_retry_attempt(self, attempt: int, max_attempts: int, temperature: float):
         idx = self.fragment.get('index', 0)
         self.retry_progress.emit(idx, attempt, max_attempts, temperature)
@@ -628,9 +636,11 @@ class TranslatorApp(QMainWindow):
         self.auto_fix_spinbox.setStyleSheet(SPINBOX_STYLE)
         row_layout.addWidget(self.auto_fix_spinbox)
 
-        btn_cancel = QPushButton("✖ Cancel")
-        btn_cancel.clicked.connect(self.cancel_translation)
-        btn_cancel.setStyleSheet("""
+        self.btn_cancel = QPushButton("✖ Cancel")
+        self._hard_cancel_mode = False
+        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
+        self.btn_cancel.setToolTip("Click: finish the current section and stop")
+        self.btn_cancel.setStyleSheet("""
             QPushButton {
                 background-color: #4a1a1a; color: #ff9999;
                 border: 1px solid #772222; border-radius: 4px;
@@ -638,7 +648,7 @@ class TranslatorApp(QMainWindow):
             }
             QPushButton:hover { background-color: #6a2222; color: white; }
         """)
-        row_layout.addWidget(btn_cancel)
+        row_layout.addWidget(self.btn_cancel)
         bottom_left_layout.addLayout(row_layout)
 
         self.progress_bar = QProgressBar()
@@ -2689,12 +2699,85 @@ class TranslatorApp(QMainWindow):
 
         logging.info("Translation cancel requested - waiting for current fragment to finish")
 
+        self._hard_cancel_mode = True
+        self.btn_cancel.setText("⛔ Hard Cancel")
+        self.btn_cancel.setToolTip("Click: immediately stop LLM generation.")
+        self.btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #6a0000; color: #ff4444;
+                border: 2px solid #cc0000; border-radius: 4px;
+                padding: 5px 12px; font-size: 11px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #990000; color: white; }
+            QPushButton:pressed { background-color: #440000; }
+        """)
+
+    def _on_cancel_clicked(self):
+        if self._hard_cancel_mode:
+            self._hard_cancel_translation()
+        else:
+            self.cancel_translation()
+
+    def _hard_cancel_translation(self):
+        logging.info("HARD CANCEL requested by user")
+        self.translation_cancelled = True
+
+        if hasattr(self, '_cancellation_prefix'):
+            delattr(self, '_cancellation_prefix')
+
+        if hasattr(self, 'translation_queue'):
+            self.translation_queue.clear()
+
+        self.translation_timer.stop()
+        self.current_fragment_index = None
+        self.translation_start_time = None
+
+        if self.translation_orchestrator:
+            self.translation_orchestrator.hard_cancel()
+
+        if self.current_worker:
+            try:
+                self.current_worker.progress.disconnect()
+                self.current_worker.retry_progress.disconnect()
+                self.current_worker.finished.disconnect()
+            except Exception:
+                pass
+
+            if isinstance(self.current_worker, TranslationWorkerThread):
+                self.current_worker.hard_cancel()
+            elif self.current_worker.isRunning():
+                self.current_worker.terminate()
+
+            self.current_worker.deleteLater()
+            self.current_worker = None
+
+        logging.info("Hard cancel complete")
+
+        self.finalize_translation()
+
+    def _reset_cancel_button(self):
+        if not hasattr(self, 'btn_cancel'):
+            return
+        self._hard_cancel_mode = False
+        self.btn_cancel.setText("✖ Cancel")
+        self.btn_cancel.setToolTip("Click: finish the current section and stop")
+        self.btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #4a1a1a; color: #ff9999;
+                border: 1px solid #772222; border-radius: 4px;
+                padding: 5px 12px; font-size: 11px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #6a2222; color: white; }
+        """)
+
     def finalize_translation(self):
         self.translation_timer.stop()
+        self.current_fragment_index = None
+        self.translation_start_time = None
         self.progress_bar.setVisible(False)
 
         if self.translation_cancelled:
-            self.statusBar().showMessage("Translation cancelled.", 5000)
+            self.statusBar().showMessage("⛔ Translation cancelled.", 5000)
             logging.info("Translation process cancelled by user")
         else:
             self.statusBar().showMessage("Translation completed.", 5000)
@@ -2712,6 +2795,8 @@ class TranslatorApp(QMainWindow):
 
         self.btn_translate.setVisible(True)
         self.btn_save_file.setVisible(True)
+
+        self._reset_cancel_button()
 
     def on_retry_progress(self, idx: int, attempt: int, max_attempts: int, temperature: float):
         self.current_retry_attempt = attempt
