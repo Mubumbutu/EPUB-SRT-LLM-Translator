@@ -1277,7 +1277,7 @@ class TranslationOrchestrator:
 
         if '\n' in core_text:
             use_ps_markers = fragment.get('use_ps_markers', True)
-            processing_mode = fragment.get('processing_mode', 'legacy')
+            processing_mode = fragment.get('processing_mode', 'inline')
 
             tokens = re.split(r'(\n\n|\n)', core_text)
             original_parts = []
@@ -1553,6 +1553,7 @@ def build_context_section(
         return "\n\n".join(texts)
 
     return build_text(context_before), build_text(context_after)
+
 
 
 
