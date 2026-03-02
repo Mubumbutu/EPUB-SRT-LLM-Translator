@@ -241,8 +241,14 @@ class EPUBProcessor(FileProcessor):
                 continue
 
             if tag_name in CONTAINER_TAGS:
-                logger.debug(f"   📦 Container <{tag_name}> - recursing into children")
-                self._extract_elements_lxml(child, item_href, seen)
+                child_elements = [c for c in child if isinstance(c, etree._Element)]
+
+                if not child_elements and self._has_any_text(child):
+                    logger.debug(f"   📝 Leaf container <{tag_name}> with text - processing directly")
+                    self._process_element_lxml(child, item_href, seen)
+                else:
+                    logger.debug(f"   📦 Container <{tag_name}> - recursing into children")
+                    self._extract_elements_lxml(child, item_href, seen)
                 continue
 
             element_has_content = False
@@ -294,8 +300,10 @@ class EPUBProcessor(FileProcessor):
         }
 
         if tag_name in CONTAINER_TAGS:
-            logger.warning(f"⚠️ Container <{tag_name}> reached _process_element_lxml - SKIPPING")
-            return
+            child_elements = [c for c in element if isinstance(c, etree._Element)]
+            if child_elements:
+                logger.warning(f"⚠️ Container <{tag_name}> with children reached _process_element_lxml - SKIPPING")
+                return
 
         use_inline = self.app_settings.get('use_inline_formatting', True)
 
@@ -1371,4 +1379,3 @@ class FileProcessorFactory:
             return TXTProcessor()
         else:
             raise ValueError(f"Unsupported file type: {file_type}")
-
