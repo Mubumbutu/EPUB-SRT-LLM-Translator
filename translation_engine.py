@@ -1294,9 +1294,6 @@ class TranslationOrchestrator:
                 fragment['_original_separators'] = []
                 fragment['_used_ps_marker'] = False
                 core_text = ' '.join(p.strip() for p in original_parts if p.strip())
-                logger.debug(
-                    f"Paragraph structure disabled: flattened {len(original_parts)} parts, no restoration"
-                )
             else:
                 fragment['_had_newlines'] = True
                 fragment['_original_parts'] = original_parts
@@ -1305,17 +1302,9 @@ class TranslationOrchestrator:
                 if processing_mode == 'inline':
                     fragment['_used_ps_marker'] = True
                     core_text = '<ps>'.join(p.strip() for p in original_parts if p.strip())
-                    logger.debug(
-                        f"Inline mode: inserted <ps> markers "
-                        f"({len(original_parts)} parts, separators={original_separators})"
-                    )
                 else:
                     fragment['_used_ps_marker'] = False
                     core_text = ' '.join(p.strip() for p in original_parts if p.strip())
-                    logger.debug(
-                        f"Legacy/TXT mode: flattened {len(original_parts)} parts "
-                        f"(will restore proportionally after LLM)"
-                    )
         else:
             fragment['_had_newlines'] = False
             fragment['_original_parts'] = []
@@ -1437,6 +1426,13 @@ class TranslationOrchestrator:
 
             cleaned = self._restore_paragraph_structure(cleaned, fragment)
 
+            if self.formatting_sync:
+                cleaned = self.formatting_sync.sync_formatting(
+                    original=fragment['original_text'],
+                    translated=cleaned,
+                    para=fragment
+                )
+
             logger.info("")
             logger.info("🔧 EXTRACTED TRANSLATION (restored):")
             logger.info("-" * 80)
@@ -1557,5 +1553,6 @@ def build_context_section(
         return "\n\n".join(texts)
 
     return build_text(context_before), build_text(context_after)
+
 
 
