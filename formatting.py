@@ -155,8 +155,13 @@ def get_first_letter_info(text: str) -> Tuple[Optional[int], Optional[bool]]:
     if not text_work:
         return None, None
 
+    in_tag = False
     for i, char in enumerate(text_work):
-        if char.isalpha():
+        if char == '<':
+            in_tag = True
+        elif char == '>':
+            in_tag = False
+        elif char.isalpha() and not in_tag:
             return i, char.isupper()
 
     return None, None
@@ -1173,8 +1178,13 @@ class FormattingSynchronizer:
             if not text_work:
                 return None, None
 
+            in_tag = False
             for i, char in enumerate(text_work):
-                if char.isalpha():
+                if char == '<':
+                    in_tag = True
+                elif char == '>':
+                    in_tag = False
+                elif char.isalpha() and not in_tag:
                     return i, char.isupper()
 
             return None, None
@@ -1197,8 +1207,13 @@ class FormattingSynchronizer:
             return translated
 
         result_chars = list(trans_no_quotes_stripped)
+        in_tag = False
         for i, char in enumerate(result_chars):
-            if char.isalpha():
+            if char == '<':
+                in_tag = True
+            elif char == '>':
+                in_tag = False
+            elif char.isalpha() and not in_tag:
                 if orig_is_upper:
                     result_chars[i] = char.upper()
                 else:
@@ -1444,8 +1459,13 @@ class FormattingSynchronizer:
                 return trans_line
 
             result_chars = list(trans_no_quotes_stripped)
+            in_tag = False
             for i, char in enumerate(result_chars):
-                if char.isalpha():
+                if char == '<':
+                    in_tag = True
+                elif char == '>':
+                    in_tag = False
+                elif char.isalpha() and not in_tag:
                     if orig_is_upper:
                         result_chars[i] = char.upper()
                     else:
