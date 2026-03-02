@@ -240,7 +240,7 @@ class TranslatorApp(QMainWindow):
         self.mismatch_checker: Optional[MismatchChecker] = None
         self.formatting_sync: Optional[FormattingSynchronizer] = None
         self.translation_orchestrator: Optional[TranslationOrchestrator] = None
-        self.prompt_manager: Optional[PromptManager] = None
+        self.prompt_manager: PromptManager = PromptManager()
         self.current_prompts_cache: Dict[str, Dict[str, str]] = {}
 
         self.paragraphs: List[Dict] = []
@@ -294,7 +294,8 @@ class TranslatorApp(QMainWindow):
         else:
             self.formatting_sync = None
 
-        self.prompt_manager = PromptManager()
+        if hasattr(self, 'mismatch_check_checkboxes'):
+            self._on_mismatch_check_toggled()
 
     def init_ui(self):
         translator_widget = QWidget()
@@ -2012,8 +2013,7 @@ class TranslatorApp(QMainWindow):
         self.populate_list()
         self.update_file_label()
 
-        if self.llm_editor_container.isVisible():
-            self.update_llm_editor_content()
+        self.update_llm_editor_content()
 
         self._update_status_after_file_load()
 
