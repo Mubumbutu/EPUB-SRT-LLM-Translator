@@ -487,16 +487,16 @@ These mark images, <br> tags, non-translatable elements.
 I understand. I will translate ONLY <text_to_translate>, using context for narrative consistency."""
 
         if variant == "txt":
-            return base + " I will preserve paragraph structure."
+            return base
 
         elif variant == "srt":
-            return base + " I will maintain line breaks (\\n) and dialogue dashes (-)."
+            return base
 
         elif variant == "epub_legacy":
-            return base + " I will preserve all <id_XX> placeholders in their positions."
+            return base
 
         elif variant == "epub_inline":
-            return base + " I will preserve all <id_XX> and keep <p_XX>...</p_XX> pairs intact around the same words."
+            return base
 
         return base
 
@@ -507,16 +507,16 @@ I understand. I will translate ONLY <text_to_translate>, using context for narra
 Translate FULL text inside <text_to_translate> tags. Do not skip, shorten, or omit any part. Keep all placeholders and formatting intact, and preserve the tone, including any strong language.
 
 Return format:
-<translated>Your translation here</translated>"""
+<translated>Translation here</translated>"""
 
         if variant == "txt":
             return base
 
         elif variant == "srt":
-            return base + "\n\nCRITICAL: Preserve line breaks (\\n) and dialogue dashes (-)."
+            return base
 
         elif variant == "epub_inline":
-            return base + "\n\nAlways keep every <p_XX>...</p_XX> pair exactly as they appear in <text_to_translate>{core_text}</text_to_translate>."
+            return base
 
         return base
 
