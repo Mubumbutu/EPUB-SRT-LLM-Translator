@@ -226,7 +226,6 @@ class EPUBProcessor(FileProcessor):
             'table', 'tbody', 'thead', 'tfoot', 'tr',
             'div', 'section', 'article', 'aside', 'nav', 'main',
             'header', 'footer', 'figure', 'body',
-            'blockquote'
         }
 
         for child in root:
@@ -1372,3 +1371,4 @@ class FileProcessorFactory:
             return TXTProcessor()
         else:
             raise ValueError(f"Unsupported file type: {file_type}")
+
