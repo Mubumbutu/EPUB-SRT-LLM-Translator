@@ -12,10 +12,16 @@ A desktop application for translating **EPUB**, **SRT**, and **TXT** files using
 <summary>Click to expand</summary>
 
 <br>
+<img width="726" height="807" alt="santo_en" src="https://github.com/user-attachments/assets/8794fe34-088d-44b7-9450-c2c693aa6257" />
+<img width="726" height="806" alt="santo_pl" src="https://github.com/user-attachments/assets/7ddb780f-1ee8-4b91-a928-f8a9638a8206" />
+<img width="730" height="805" alt="crim_en" src="https://github.com/user-attachments/assets/0d7bab6c-ce89-444e-8eb3-180361d3dfc4" />
+<img width="728" height="806" alt="crim_fr" src="https://github.com/user-attachments/assets/65025235-22e0-4362-a7cd-000495462fbb" />
+<img width="729" height="805" alt="ennew" src="https://github.com/user-attachments/assets/51d10874-0d9c-487f-98f7-4c03b5e3cf5b" />
+<img width="729" height="806" alt="gernew" src="https://github.com/user-attachments/assets/a0a72762-8263-46fb-b719-fdff41f4b534" />
+<img width="728" height="806" alt="zielo_en" src="https://github.com/user-attachments/assets/8c1f3ff2-a305-4188-a955-e68fafe4ab8d" />
+<img width="729" height="806" alt="zielo_es" src="https://github.com/user-attachments/assets/687303ad-b221-4610-abad-f54fab012755" />
 
-<img width="802" height="1020" alt="en" src="https://github.com/user-attachments/assets/2529761d-3765-41de-a872-bad7266877d7" />
-<br>
-<img width="799" height="1017" alt="pl" src="https://github.com/user-attachments/assets/5f849c44-4dcc-4493-a8a5-f89990fa4ed2" />
+
 
 </details>
 
