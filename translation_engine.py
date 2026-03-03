@@ -780,8 +780,6 @@ class AutoFixManager:
     ) -> List[str]:
         lines = []
 
-        is_numbered_list = bool(re.match(r'^\d+\.\s+\w+', original))
-
         if flag_key == 'reserve_elements':
             if isinstance(flag_value, dict):
                 missing   = flag_value.get('missing', [])
@@ -790,22 +788,21 @@ class AutoFixManager:
                 pos_errors = flag_value.get('positioning', [])
 
                 if missing:
-                    lines.append(f"  ❌ Missing placeholders: {', '.join(missing[:3])}")
-                    if len(missing) > 3:
-                        lines.append(f"     ... and {len(missing) - 3} more")
+                    lines.append(f"  ❌ Missing placeholders: {', '.join(missing[:4])}")
+                    if len(missing) > 4:
+                        lines.append(f"     ... and {len(missing) - 4} more")
                 if extra:
-                    lines.append(f"  ❌ Extra placeholders: {', '.join(extra[:3])}")
-                    if len(extra) > 3:
-                        lines.append(f"     ... and {len(extra) - 3} more")
+                    lines.append(f"  ❌ Extra placeholders: {', '.join(extra[:4])}")
+                    if len(extra) > 4:
+                        lines.append(f"     ... and {len(extra) - 4} more")
                 if spurious:
                     lines.append(f"  ❌ Spurious CLOSING tags (LLM bug): {', '.join(spurious)}")
-                    lines.append(f"     → Placeholders like <id_00> are self-closing — NO closing tag!")
-                    lines.append(f"     → Remove: {', '.join(spurious)}")
+                    lines.append(f"     → <id_xx> are self-closing — remove all closing tags!")
 
                 if pos_errors:
                     lines.append("")
-                    lines.append(f"  ❌ PLACEHOLDER POSITION ERRORS (<id_xx> are in wrong places):")
-                    for error in pos_errors[:3]:
+                    lines.append(f"  ❌ PLACEHOLDER POSITION ERRORS:")
+                    for error in pos_errors[:4]:
                         tag_id = error.get('tag_id', '??')
                         orig_pct = int(error.get('orig_rel_pos', 0) * 100)
                         trans_pct = int(error.get('trans_rel_pos', 0) * 100)
@@ -815,20 +812,46 @@ class AutoFixManager:
             if isinstance(flag_value, dict):
                 lines.append("  ❌ Non-translatable markers (<nt_xx/>) are wrong or missing")
                 if flag_value.get('missing'):
-                    lines.append(f"     Missing: {', '.join(flag_value['missing'][:3])}")
+                    lines.append(f"     Missing: {', '.join(flag_value['missing'][:4])}")
                 if flag_value.get('positioning'):
                     lines.append("     Wrong position — must stay exactly where they were")
 
         elif flag_key == 'inline_formatting':
-            lines.append("  ❌ Inline formatting tags (<p_xx> or <i>, <b> etc.) are broken")
-            if isinstance(flag_value, dict):
+            lines.append("  ❌ Inline formatting tags (<p_xx>) are broken or mismatched")
+
+            if isinstance(flag_value, dict) and flag_value:
+                # Opening tags
+                if 'opening_tags' in flag_value:
+                    ot = flag_value['opening_tags']
+                    if ot.get('missing'):
+                        lines.append(f"     ❌ Missing opening: {', '.join(ot['missing'][:6])}")
+                    if ot.get('extra'):
+                        lines.append(f"     ❌ Extra opening: {', '.join(ot['extra'][:6])}")
+
+                # Closing tags
+                if 'closing_tags' in flag_value:
+                    ct = flag_value['closing_tags']
+                    if ct.get('missing'):
+                        lines.append(f"     ❌ Missing closing: {', '.join(ct['missing'][:6])}")
+                    if ct.get('extra'):
+                        lines.append(f"     ❌ Extra closing: {', '.join(ct['extra'][:6])}")
+
                 if 'unexpected_tags' in flag_value:
                     lines.append(f"     Found raw HTML tags: {', '.join(flag_value['unexpected_tags'])}")
-                    lines.append("     → Use ONLY <p_00>, <p_01> placeholders — never raw <i>, <b> etc.")
+                    lines.append("     → Use ONLY <p_00>, <p_01>... placeholders")
+
                 if flag_value.get('unpaired_tags'):
                     lines.append("     Unpaired opening/closing tags")
+
                 if flag_value.get('positioning'):
                     lines.append("     Tags are in wrong places")
+
+            else:
+                lines.append("     (no detailed info – probably missing/extra <p_XX> tags)")
+
+            # Specjalna rada dla tytułów rozdziałów (bardzo częsty przypadek błędu)
+            if len(original.strip()) < 80 and '<p_' not in original:
+                lines.append("     💡 This looks like a chapter title — LLM often adds phantom <p_xx> tags here.")
 
         elif flag_key == 'ps_markers':
             ps_in_orig = original.count('<ps>')
@@ -837,9 +860,9 @@ class AutoFixManager:
             lines.append(f"     Original: {ps_in_orig} <ps> markers")
             lines.append(f"     Translation: {ps_in_trans} <ps> markers")
             if ps_in_orig > ps_in_trans:
-                lines.append(f"  → You are MISSING {ps_in_orig - ps_in_trans} <ps> marker(s)!")
+                lines.append(f"  → MISSING {ps_in_orig - ps_in_trans} <ps> marker(s)!")
             elif ps_in_orig < ps_in_trans:
-                lines.append(f"  → You have {ps_in_trans - ps_in_orig} TOO MANY <ps> marker(s)!")
+                lines.append(f"  → TOO MANY {ps_in_trans - ps_in_orig} <ps> marker(s)!")
 
         elif flag_key == 'length':
             if isinstance(flag_value, dict):
@@ -861,7 +884,7 @@ class AutoFixManager:
         elif flag_key == 'unexpected_html':
             lines.append("  ❌ Raw HTML tags found in output")
             lines.append(f"     Tags: {', '.join(flag_value) if isinstance(flag_value, list) else str(flag_value)}")
-            lines.append("     → Use ONLY <p_00>, <p_01> placeholders for formatting")
+            lines.append("     → Use ONLY <p_00>, <p_01> placeholders")
 
         elif flag_key == 'first_char':
             orig_first_char, orig_desc   = self._get_first_char_details(original)
@@ -870,9 +893,7 @@ class AutoFixManager:
                 lines.append(f"  ❌ First character mismatch:")
                 lines.append(f"     Original starts with {orig_desc}: '{orig_first_char}'")
                 lines.append(f"     Translation starts with {trans_desc}: '{trans_first_char}'")
-                lines.append(f"  → Fix: Translation should start with {orig_desc}")
-            else:
-                lines.append(f"  First character type mismatch")
+                lines.append(f"  → Translation should start with {orig_desc}")
 
         elif flag_key == 'last_char':
             orig_last_info  = self._get_last_char_details(original)
