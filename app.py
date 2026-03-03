@@ -3185,8 +3185,8 @@ class TranslatorApp(QMainWindow):
         if flags.get("length"):
             orig_text = para_data.get("original_text", "")
             trans_text = para_data.get("translated_text", "")
-            orig_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>', '', orig_text)
-            trans_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>', '', trans_text)
+            orig_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|</?ps>|<nt_\d{2}/>', '', orig_text)
+            trans_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|</?ps>|<nt_\d{2}/>', '', trans_text)
             orig_len = len(orig_clean)
             trans_len = len(trans_clean)
             ratio = trans_len / max(orig_len, 1)
@@ -3205,8 +3205,8 @@ class TranslatorApp(QMainWindow):
         if flags.get("first_char"):
             orig_text = para_data.get("original_text", "")
             trans_text = para_data.get("translated_text", "")
-            orig_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>', '', orig_text)
-            trans_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>', '', trans_text)
+            orig_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|</?ps>|<nt_\d{2}/>', '', orig_text)
+            trans_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|</?ps>|<nt_\d{2}/>', '', trans_text)
             orig_desc = self._describe_first_char(orig_clean)
             trans_desc = self._describe_first_char(trans_clean)
             formatting_issues.append(
@@ -3216,8 +3216,8 @@ class TranslatorApp(QMainWindow):
         if flags.get("last_char"):
             orig_text = para_data.get("original_text", "")
             trans_text = para_data.get("translated_text", "")
-            orig_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>', '', orig_text)
-            trans_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>', '', trans_text)
+            orig_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|</?ps>|<nt_\d{2}/>', '', orig_text)
+            trans_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|</?ps>|<nt_\d{2}/>', '', trans_text)
             orig_desc = self._describe_last_char(orig_clean)
             trans_desc = self._describe_last_char(trans_clean)
             formatting_issues.append(
@@ -3238,11 +3238,12 @@ class TranslatorApp(QMainWindow):
 
         reserve_errors = flags.get("reserve_elements")
         if reserve_errors and isinstance(reserve_errors, dict):
-            missing   = reserve_errors.get("missing", [])
-            extra     = reserve_errors.get("extra", [])
-            spurious  = reserve_errors.get("spurious_closing", [])
+            missing          = reserve_errors.get("missing", [])
+            extra            = reserve_errors.get("extra", [])
+            spurious         = reserve_errors.get("spurious_closing", [])
+            positioning_res  = reserve_errors.get("positioning", [])
 
-            if missing or extra or spurious:
+            if missing or extra or spurious or positioning_res:
                 lines.append("<u>Reserve Elements (&lt;id_XX&gt;):</u>")
                 if missing:
                     missing_str = ", ".join(missing[:5])
@@ -3258,11 +3259,37 @@ class TranslatorApp(QMainWindow):
                     spurious_str = ", ".join(spurious[:5])
                     lines.append(f"• <b>Spurious closing tags (LLM bug):</b> {spurious_str}")
                     lines.append(f"  &nbsp;&nbsp;<i>&lt;id_XX&gt; are self-closing — no closing tag needed!</i>")
+                if positioning_res:
+                    lines.append(f"• <b>Position shifted ({len(positioning_res)} tag(s)):</b>")
+                    for pos_err in positioning_res[:3]:
+                        tag_id = pos_err.get('tag_id', '??')
+                        desc   = pos_err.get('description', '')
+                        if desc:
+                            lines.append(f"  &nbsp;&nbsp;<i>{desc}</i>")
+                        else:
+                            orig_pos  = pos_err.get('orig_rel_pos', 0)
+                            trans_pos = pos_err.get('trans_rel_pos', 0)
+                            lines.append(
+                                f"  &nbsp;&nbsp;id_{tag_id}: ~{orig_pos:.0%} in original "
+                                f"→ ~{trans_pos:.0%} in translation"
+                            )
+                    if len(positioning_res) > 3:
+                        lines.append(f"  &nbsp;&nbsp;... (+{len(positioning_res) - 3} more)")
                 lines.append("")
 
         inline_errors = flags.get("inline_formatting")
         if inline_errors and isinstance(inline_errors, dict):
             lines.append("<u>Inline Formatting (&lt;p_XX&gt;):</u>")
+
+            unexpected_tags = inline_errors.get("unexpected_tags", [])
+            if unexpected_tags:
+                unique_tags = list(dict.fromkeys(unexpected_tags))
+                tags_str = ", ".join(f"&lt;{t}&gt;" for t in unique_tags[:5])
+                if len(unique_tags) > 5:
+                    tags_str += f", ... (+{len(unique_tags) - 5} more)"
+                lines.append(f"• <b>Unexpected HTML tags in translation (LLM bug):</b> {tags_str}")
+                lines.append(f"  &nbsp;&nbsp;<i>Translation contains raw HTML not present in original</i>")
+
             opening_errors = inline_errors.get("opening_tags", {})
             if opening_errors:
                 missing_opens = opening_errors.get("missing", [])
@@ -3277,6 +3304,7 @@ class TranslatorApp(QMainWindow):
                     if len(extra_opens) > 5:
                         opens_str += f", ... (+{len(extra_opens) - 5} more)"
                     lines.append(f"• <b>Extra opening tags:</b> {opens_str}")
+
             closing_errors = inline_errors.get("closing_tags", {})
             if closing_errors:
                 missing_closes = closing_errors.get("missing", [])
@@ -3291,18 +3319,74 @@ class TranslatorApp(QMainWindow):
                     if len(extra_closes) > 5:
                         closes_str += f", ... (+{len(extra_closes) - 5} more)"
                     lines.append(f"• <b>Extra closing tags:</b> {closes_str}")
+
             unpaired = inline_errors.get("unpaired_tags", [])
             if unpaired:
                 lines.append(f"• <b>Unpaired tags:</b>")
                 for tag_info in unpaired[:3]:
-                    tag_id     = tag_info.get('tag_id', '??')
-                    open_count = tag_info.get('open_count', 0)
+                    tag_id      = tag_info.get('tag_id', '??')
+                    open_count  = tag_info.get('open_count', 0)
                     close_count = tag_info.get('close_count', 0)
                     lines.append(
                         f"  &nbsp;&nbsp;p_{tag_id}: {open_count} opening, {close_count} closing"
                     )
                 if len(unpaired) > 3:
                     lines.append(f"  &nbsp;&nbsp;... (+{len(unpaired) - 3} more)")
+
+            positioning = inline_errors.get("positioning", [])
+            if positioning:
+                lines.append(f"• <b>Position shifted ({len(positioning)} tag(s)):</b>")
+                for pos_err in positioning[:3]:
+                    tag_id = pos_err.get('tag_id', '??')
+                    issue  = pos_err.get('issue', '')
+                    desc   = pos_err.get('description', '')
+                    if desc:
+                        lines.append(f"  &nbsp;&nbsp;<i>{desc}</i>")
+                    elif issue == 'coverage_mismatch':
+                        orig_cov      = pos_err.get('orig_coverage', 0)
+                        trans_cov     = pos_err.get('trans_coverage', 0)
+                        orig_content  = pos_err.get('orig_content', '')
+                        trans_content = pos_err.get('trans_content', '')
+                        lines.append(
+                            f"  &nbsp;&nbsp;p_{tag_id}: covers {orig_cov:.0%} in original "
+                            f"→ {trans_cov:.0%} in translation"
+                        )
+                        if orig_content or trans_content:
+                            lines.append(
+                                f"  &nbsp;&nbsp;&nbsp;&nbsp;"
+                                f"orig: <i>\"{orig_content[:40]}{'…' if len(orig_content) > 40 else ''}\"</i>"
+                            )
+                            lines.append(
+                                f"  &nbsp;&nbsp;&nbsp;&nbsp;"
+                                f"trans: <i>\"{trans_content[:40]}{'…' if len(trans_content) > 40 else ''}\"</i>"
+                            )
+                    elif issue == 'position_shift':
+                        orig_s        = pos_err.get('orig_rel_start', 0)
+                        trans_s       = pos_err.get('trans_rel_start', 0)
+                        orig_content  = pos_err.get('orig_content', '')
+                        trans_content = pos_err.get('trans_content', '')
+                        lines.append(
+                            f"  &nbsp;&nbsp;p_{tag_id}: starts at {orig_s:.0%} in original "
+                            f"→ {trans_s:.0%} in translation"
+                        )
+                        if orig_content or trans_content:
+                            lines.append(
+                                f"  &nbsp;&nbsp;&nbsp;&nbsp;"
+                                f"orig: <i>\"{orig_content[:40]}{'…' if len(orig_content) > 40 else ''}\"</i>"
+                            )
+                            lines.append(
+                                f"  &nbsp;&nbsp;&nbsp;&nbsp;"
+                                f"trans: <i>\"{trans_content[:40]}{'…' if len(trans_content) > 40 else ''}\"</i>"
+                            )
+                    elif issue == 'nesting_mismatch':
+                        orig_parent  = pos_err.get('orig_parent')
+                        trans_parent = pos_err.get('trans_parent')
+                        lines.append(
+                            f"  &nbsp;&nbsp;p_{tag_id}: nested inside p_{orig_parent} in original "
+                            f"→ p_{trans_parent} in translation"
+                        )
+                if len(positioning) > 3:
+                    lines.append(f"  &nbsp;&nbsp;... (+{len(positioning) - 3} more)")
 
             nt_errors = inline_errors.get("nt_markers", {})
             if nt_errors:
