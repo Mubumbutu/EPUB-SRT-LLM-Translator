@@ -453,10 +453,13 @@ class MismatchChecker:
         if self.checks.get("length", True):
             orig_len = len(orig.strip())
             trans_len = len(trans.strip())
+            too_short_threshold = self.thresholds.get("length_ratio_too_short", 0.45)
             if orig_len < 80:
                 length_flag = trans_len > orig_len * 1.75
             else:
                 length_flag = trans_len > orig_len * 2.5
+            if not length_flag and orig_len >= 8:
+                length_flag = trans_len < orig_len * too_short_threshold
             if length_flag:
                 mismatch_flags["length"] = {
                     "orig_chars": orig_len,
@@ -571,12 +574,17 @@ class MismatchChecker:
             mismatch_flags["last_char"] = True
 
         if self.checks.get("length", True):
+            orig_len = len(orig.strip())
+            trans_len = len(trans.strip())
+            too_short_threshold = self.thresholds.get("length_ratio_too_short", 0.45)
             length_flag = self._dynamic_length_mismatch(orig, trans)
             if length_flag:
                 orig_words = len(orig.split())
                 trans_words = len(trans.split())
                 if 0.5 <= trans_words / max(orig_words, 1) <= 3.0:
                     length_flag = False
+            if not length_flag and orig_len >= 8:
+                length_flag = trans_len < orig_len * too_short_threshold
             if length_flag:
                 mismatch_flags["length"] = True
 
