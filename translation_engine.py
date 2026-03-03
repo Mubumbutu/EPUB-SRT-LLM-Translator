@@ -817,12 +817,13 @@ class AutoFixManager:
             lines.append(f"     Translation: {trans_count} paragraph(s)")
 
             if use_ps_markers:
-                ps_in_orig  = original.count('<ps>')
-                ps_in_trans = translation.count('<ps>')
+                ps_in_orig  = max(orig_count - 1, 0)
+                ps_in_trans = max(trans_count - 1, 0)
+
                 lines.append(f"")
                 lines.append(f"  ⚠️ IMPORTANT: This text uses <ps> markers for paragraph boundaries.")
-                lines.append(f"     Original text contained {ps_in_orig} <ps> marker(s).")
-                lines.append(f"     Your translation has {ps_in_trans} <ps> marker(s).")
+                lines.append(f"     Original text requires {ps_in_orig} <ps> marker(s) (for {orig_count} paragraphs).")
+                lines.append(f"     Your translation has {ps_in_trans} <ps> marker(s) (for {trans_count} paragraphs).")
                 if ps_in_orig > ps_in_trans:
                     lines.append(f"  → You are MISSING {ps_in_orig - ps_in_trans} <ps> marker(s)!")
                     lines.append(f"  → Do NOT create new paragraph breaks with \\n or \\n\\n.")
