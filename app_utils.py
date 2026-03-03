@@ -599,18 +599,9 @@ Return format:
         else:
             variant_instructions = ""
 
-        auto_fix_ready = (
-            "IMPORTANT: You may receive additional instructions starting with:\\n"
-            "=== AUTO-FIX INSTRUCTIONS - CRITICAL ===\\n"
-            "If you see them, you MUST fix the listed issues in your previous translation.\\n"
-            "Then return the corrected translation in the exact same JSON format.\\n"
-            "Do not mention the auto-fix instructions in your response.\\n\\n"
-        )
-
         content = (
             base_instructions
             + variant_instructions
-            + auto_fix_ready
             + "Context before (for reference only, do NOT translate):\\n"
             "{context_before}\\n\\n"
             "Text to translate:\\n"
@@ -832,3 +823,4 @@ __all__ = [
     'QuoteConstants',
     'LanguageConstants'
 ]
+
