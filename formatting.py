@@ -337,17 +337,28 @@ class MismatchChecker:
 
     def _detect_raw_html_and_drift(self, orig: str, trans_raw: str, trans: str) -> Dict:
         flags = {}
+
         unexpected = re.findall(r'</?([a-zA-Z][^>\s]*)[^>]*>', trans_raw)
-        allowed = {'p', 'id', 'nt', 'ps', 'translated', 'translation'}
-        bad_tags = [t for t in unexpected if t.lower() not in allowed]
+
+        def _is_allowed_tag(tag: str) -> bool:
+            t = tag.lower()
+            if t in {'p', 'id', 'nt', 'ps', 'translated', 'translation'}:
+                return True
+            if re.match(r'^/?(?:p|id|nt)_\d{2}$', t):
+                return True
+            return False
+
+        bad_tags = [t for t in unexpected if not _is_allowed_tag(t)]
         if bad_tags:
             flags["unexpected_html"] = bad_tags
+
         orig_words = set(re.findall(r'\b\w+\b', orig.lower()))
         trans_words = set(re.findall(r'\b\w+\b', trans.lower()))
         if orig_words and len(trans) > len(orig) * 1.6:
             overlap = len(orig_words & trans_words) / len(orig_words)
             if overlap < 0.40:
                 flags["content_drift"] = True
+
         return flags
 
     def _check_mismatch_inline(self, para: Dict) -> Tuple[bool, Dict]:
@@ -851,7 +862,7 @@ class MismatchChecker:
         text = re.sub(r'</id_\d{2}>', '', text)
         text = re.sub(r'</?p_\d{2}>', '', text)
         text = re.sub(r'<nt_\d{2}/>', '', text)
-        text = re.sub(r'<ps>', '', text)
+        text = re.sub(r'</?ps>', '', text)
         return text
 
     def _check_nt_markers_integrity(self, original: str, translated: str) -> Tuple[bool, Optional[Dict]]:
