@@ -493,6 +493,37 @@ class PromptBuilder:
             filled = self.json_payload_template.replace("{core_text}", json_escape(core_text))
             filled = filled.replace("{context_before}", json_escape(context_before))
             filled = filled.replace("{context_after}", json_escape(context_after))
+
+            if auto_fix_section and auto_fix_section.strip():
+                auto_fix_formatted = (
+                    "\\n\\n"
+                    "=== AUTO-FIX INSTRUCTIONS - CRITICAL ===\\n"
+                    "You MUST fix the following issues in your previous translation:\\n\\n"
+                    + json_escape(auto_fix_section.strip()) +
+                    "\\n\\n"
+                    "=== END OF AUTO-FIX INSTRUCTIONS ===\\n"
+                    "Return ONLY the corrected translation in the same JSON format as before."
+                )
+
+                try:
+                    payload_dict = json.loads(filled)
+                    if isinstance(payload_dict, dict):
+                        # Najpierw próbujemy dodać do pola "messages"
+                        if "messages" in payload_dict and isinstance(payload_dict["messages"], list):
+                            for msg in payload_dict["messages"]:
+                                if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                                    msg["content"] = msg["content"].rstrip() + auto_fix_formatted
+                                    break
+                        elif isinstance(payload_dict.get("content"), str):
+                            payload_dict["content"] = payload_dict["content"].rstrip() + auto_fix_formatted
+                        # Fallback
+                        else:
+                            filled = filled.rstrip() + auto_fix_formatted
+                    else:
+                        filled = filled.rstrip() + auto_fix_formatted
+                except (json.JSONDecodeError, TypeError):
+                    filled = filled.rstrip() + auto_fix_formatted
+
             try:
                 payload_dict = json.loads(filled)
             except json.JSONDecodeError as e:
@@ -500,7 +531,7 @@ class PromptBuilder:
                     f"Invalid JSON Payload Template: {e}\n"
                     f"Check the template in the LLM Instructions Editor."
                 )
-            logger.debug(f"Built JSON payload: {len(filled)} chars")
+
             return {
                 "__json_payload__": payload_dict,
                 "__response_field__": self.json_response_field
@@ -512,11 +543,8 @@ class PromptBuilder:
                 context_before=context_before,
                 context_after=context_after
             )
-
             if auto_fix_section:
                 prompt += "\n\n" + auto_fix_section
-
-            logger.debug(f"Built Ollama prompt: {len(prompt)} chars")
             return prompt
 
         else:
@@ -549,24 +577,15 @@ class PromptBuilder:
                     merged += assistant_content + "\n\n"
                 if user_content:
                     merged += user_content
-
-                messages = [{"role": "user", "content": merged}]
-                logger.debug(f"Built single-prompt: {len(merged)} chars")
-                return messages
-
+                return [{"role": "user", "content": merged}]
             else:
                 messages = []
-
                 if system_content:
                     messages.append({"role": "system", "content": system_content})
-
                 if assistant_content:
                     messages.append({"role": "assistant", "content": assistant_content})
-
                 if user_content:
                     messages.append({"role": "user", "content": user_content})
-
-                logger.debug(f"Built {len(messages)}-message prompt")
                 return messages
 
 class AutoFixManager:
@@ -785,194 +804,64 @@ class AutoFixManager:
 
                 if pos_errors:
                     lines.append("")
-                    lines.append(f"  ❌ PLACEHOLDER POSITION ERRORS  (<id_xx> are in wrong places):")
-                    lines.append("")
+                    lines.append(f"  ❌ PLACEHOLDER POSITION ERRORS (<id_xx> are in wrong places):")
                     for error in pos_errors[:3]:
-                        tag_id        = error.get('tag_id', '??')
-                        orig_pct      = int(error.get('orig_rel_pos', 0) * 100)
-                        trans_pct     = int(error.get('trans_rel_pos', 0) * 100)
-                        lines.append(f"  <id_{tag_id}>:")
-                        lines.append(f"    • In original:    at ~{orig_pct}% of text")
-                        lines.append(f"    • In translation: at ~{trans_pct}% of text  ← WRONG")
-                        lines.append(f"    → Move <id_{tag_id}> to the position in translation that")
-                        lines.append(f"      corresponds to ~{orig_pct}% of the translated text.")
-                        lines.append(f"    → It marks an image/element that was in the original at that spot.")
-                        lines.append("")
-                    if len(pos_errors) > 3:
-                        lines.append(f"  ... and {len(pos_errors) - 3} more positioning issues")
-            else:
-                lines.append(f"  - Reserve elements mismatch")
+                        tag_id = error.get('tag_id', '??')
+                        orig_pct = int(error.get('orig_rel_pos', 0) * 100)
+                        trans_pct = int(error.get('trans_rel_pos', 0) * 100)
+                        lines.append(f"     • <id_{tag_id}> should be ~{orig_pct}% but is at ~{trans_pct}%")
 
         elif flag_key == 'nt_markers':
             if isinstance(flag_value, dict):
-                missing_nt  = flag_value.get('missing', [])
-                extra_nt    = flag_value.get('extra', [])
-                pos_errors  = flag_value.get('positioning', [])
-
-                if missing_nt:
-                    lines.append(f"  ❌ MISSING NT MARKERS (non-translatable elements):")
-                    lines.append(f"     Missing: {', '.join(missing_nt)}")
-                    lines.append(f"     These mark padding spaces and empty anchors.")
-                    lines.append(f"     → Copy them EXACTLY as they appear in the original.")
-                    lines.append(f"     → Keep them in the SAME position as in original.")
-                    lines.append(f"     → Example: if original ends with '<nt_02/>', your translation must too.")
-                if extra_nt:
-                    lines.append(f"  ❌ Extra NT markers: {', '.join(extra_nt)}")
-                    lines.append(f"     → Remove these — they do not exist in the original.")
-
-                if pos_errors:
-                    lines.append("")
-                    lines.append(f"  ❌ NT MARKER POSITION ERRORS  (<nt_xx/> are in wrong places):")
-                    lines.append("")
-                    for error in pos_errors[:3]:
-                        tag_id    = error.get('tag_id', '??')
-                        orig_pct  = int(error.get('orig_rel_pos', 0) * 100)
-                        trans_pct = int(error.get('trans_rel_pos', 0) * 100)
-                        lines.append(f"  <nt_{tag_id}/>:")
-                        lines.append(f"    • In original:    at ~{orig_pct}% of text")
-                        lines.append(f"    • In translation: at ~{trans_pct}% of text  ← WRONG")
-                        lines.append(f"    → Move <nt_{tag_id}/> to the position that corresponds")
-                        lines.append(f"      to ~{orig_pct}% of the translated text.")
-                        lines.append(f"    → NT markers represent invisible non-translatable elements")
-                        lines.append(f"      (padding spaces, empty anchors) — their position matters.")
-                        lines.append("")
-                    if len(pos_errors) > 3:
-                        lines.append(f"  ... and {len(pos_errors) - 3} more positioning issues")
-            else:
-                lines.append(f"  - NT markers mismatch")
-
-        elif flag_key == 'ps_markers':
-            if isinstance(flag_value, dict):
-                expected = flag_value.get('expected', '?')
-                found    = flag_value.get('found', '?')
-                missing  = flag_value.get('missing', 0)
-                extra    = flag_value.get('extra', 0)
-                lines.append(f"  ❌ Paragraph marker <ps> count mismatch:")
-                lines.append(f"     Original: {expected} marker(s)")
-                lines.append(f"     Translation: {found} marker(s)")
-                if missing > 0:
-                    lines.append(f"  → Translation is MISSING {missing} <ps> marker(s)!")
-                    lines.append(f"  → Insert <ps> where paragraph breaks occur in the original.")
-                elif extra > 0:
-                    lines.append(f"  → Translation has {extra} EXTRA <ps> marker(s)!")
-                    lines.append(f"  → Remove extra <ps> markers — count must match exactly.")
-                lines.append(f"  → <ps> markers indicate paragraph boundaries. Preserve them all.")
-            else:
-                lines.append(f"  - <ps> marker count mismatch")
+                lines.append("  ❌ Non-translatable markers (<nt_xx/>) are wrong or missing")
+                if flag_value.get('missing'):
+                    lines.append(f"     Missing: {', '.join(flag_value['missing'][:3])}")
+                if flag_value.get('positioning'):
+                    lines.append("     Wrong position — must stay exactly where they were")
 
         elif flag_key == 'inline_formatting':
+            lines.append("  ❌ Inline formatting tags (<p_xx> or <i>, <b> etc.) are broken")
             if isinstance(flag_value, dict):
-                opening    = flag_value.get('opening_tags', {})
-                closing    = flag_value.get('closing_tags', {})
-                unpaired   = flag_value.get('unpaired_tags', [])
-                positioning = flag_value.get('positioning', [])
+                if 'unexpected_tags' in flag_value:
+                    lines.append(f"     Found raw HTML tags: {', '.join(flag_value['unexpected_tags'])}")
+                    lines.append("     → Use ONLY <p_00>, <p_01> placeholders — never raw <i>, <b> etc.")
+                if flag_value.get('unpaired_tags'):
+                    lines.append("     Unpaired opening/closing tags")
+                if flag_value.get('positioning'):
+                    lines.append("     Tags are in wrong places")
 
-                if opening:
-                    missing_o = opening.get('missing', [])
-                    extra_o   = opening.get('extra', [])
-                    if missing_o:
-                        lines.append(f"  Missing opening: {', '.join(missing_o[:3])}")
-                    if extra_o:
-                        lines.append(f"  Extra opening: {', '.join(extra_o[:3])}")
+        elif flag_key == 'ps_markers':
+            ps_in_orig = original.count('<ps>')
+            ps_in_trans = translation.count('<ps>')
+            lines.append(f"  ❌ Paragraph structure mismatch")
+            lines.append(f"     Original: {ps_in_orig} <ps> markers")
+            lines.append(f"     Translation: {ps_in_trans} <ps> markers")
+            if ps_in_orig > ps_in_trans:
+                lines.append(f"  → You are MISSING {ps_in_orig - ps_in_trans} <ps> marker(s)!")
+            elif ps_in_orig < ps_in_trans:
+                lines.append(f"  → You have {ps_in_trans - ps_in_orig} TOO MANY <ps> marker(s)!")
 
-                if closing:
-                    missing_c = closing.get('missing', [])
-                    extra_c   = closing.get('extra', [])
-                    if missing_c:
-                        lines.append(f"  Missing closing: {', '.join(missing_c[:3])}")
-                    if extra_c:
-                        lines.append(f"  Extra closing: {', '.join(extra_c[:3])}")
-
-                if unpaired:
-                    lines.append(f"  Unpaired tags: {len(unpaired)} tag(s)")
-
-                if positioning:
-                    lines.append("")
-                    lines.append("  ❌ TAG POSITIONING ERRORS:")
-                    lines.append("")
-                    for error in positioning[:3]:
-                        tag_id    = error.get('tag_id', '??')
-                        issue     = error.get('issue', 'unknown')
-                        orig_con  = error.get('orig_content', '')
-                        trans_con = error.get('trans_content', '')
-
-                        if issue == 'position_shift':
-                            orig_pct  = int(error.get('orig_rel_start', 0) * 100)
-                            trans_pct = int(error.get('trans_rel_start', 0) * 100)
-                            lines.append(f"  Tag <p_{tag_id}>...<p_{tag_id}>:")
-                            lines.append(f"    • WRONG POSITION in text!")
-                            lines.append(f"    • In original: wraps '{orig_con}' (at ~{orig_pct}% of text)")
-                            lines.append(f"    • In translation: wraps '{trans_con}' (at ~{trans_pct}% of text)")
-                            lines.append(f"    → Move the tag to wrap the EQUIVALENT of '{orig_con}'")
-                            lines.append(f"    → Example: ...translated word... → <p_{tag_id}>translated word</p_{tag_id}>")
-                            lines.append("")
-
-                        elif issue == 'coverage_mismatch':
-                            lines.append(f"  Tag <p_{tag_id}>:")
-                            lines.append(f"    • Coverage mismatch detected")
-                            if orig_con:
-                                lines.append(f"    • In original wraps: '{orig_con}'")
-                            if trans_con:
-                                lines.append(f"    • In translation wraps: '{trans_con}'")
-                            lines.append("")
-
-                        elif issue == 'nesting_mismatch':
-                            lines.append(f"  Tag <p_{tag_id}>:")
-                            lines.append(f"    • Different nesting structure")
-                            lines.append(f"    → Keep same nesting!")
-                            lines.append("")
-
-                    if len(positioning) > 3:
-                        lines.append(f"  ... and {len(positioning) - 3} more positioning issues")
-            else:
-                lines.append(f"  - Inline formatting mismatch")
-
-        elif flag_key == 'paragraphs':
+        elif flag_key == 'length':
             if isinstance(flag_value, dict):
-                orig_count  = flag_value["orig"]
-                trans_count = flag_value["trans"]
-            else:
-                orig_clean  = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<ps>', '', original)
-                trans_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<ps>', '', translation)
-                orig_parts  = [p for p in orig_clean.split("\n\n") if p.strip()] or \
-                              [p for p in orig_clean.split("\n") if p.strip()]
-                trans_parts = [p for p in trans_clean.split("\n\n") if p.strip()] or \
-                              [p for p in trans_clean.split("\n") if p.strip()]
-                orig_count  = len(orig_parts)
-                trans_count = len(trans_parts)
+                orig_len = flag_value.get("orig_chars", 0)
+                trans_len = flag_value.get("trans_chars", 0)
+                ratio = flag_value.get("ratio", 1.0)
+                lines.append(f"  ❌ Significant length difference:")
+                lines.append(f"     Original: {orig_len} characters")
+                lines.append(f"     Translation: {trans_len} characters")
+                lines.append(f"     Ratio: {ratio:.2f}x")
+                if ratio > 1.7 and orig_len < 80:
+                    lines.append("     → This looks like a chapter title — keep it short!")
 
-            lines.append(f"  ❌ Paragraph count mismatch:")
-            lines.append(f"     Original: {orig_count} paragraph(s)")
-            lines.append(f"     Translation: {trans_count} paragraph(s)")
+        elif flag_key == 'content_drift':
+            lines.append("  ❌ CONTENT DRIFT detected")
+            lines.append("     Translation started writing completely different content")
+            lines.append("     → Stay focused only on the text inside <text_to_translate>")
 
-            if use_ps_markers:
-                ps_in_orig  = max(orig_count - 1, 0)
-                ps_in_trans = max(trans_count - 1, 0)
-
-                lines.append(f"")
-                lines.append(f"  ⚠️ IMPORTANT: This text uses <ps> markers for paragraph boundaries.")
-                lines.append(f"     Original text requires {ps_in_orig} <ps> marker(s) (for {orig_count} paragraphs).")
-                lines.append(f"     Your translation has {ps_in_trans} <ps> marker(s) (for {trans_count} paragraphs).")
-                if ps_in_orig > ps_in_trans:
-                    lines.append(f"  → You are MISSING {ps_in_orig - ps_in_trans} <ps> marker(s)!")
-                    lines.append(f"  → Do NOT create new paragraph breaks with \\n or \\n\\n.")
-                    lines.append(f"  → Instead, insert <ps> exactly where paragraph boundaries")
-                    lines.append(f"     appear in the original text — count must be {ps_in_orig}.")
-                elif ps_in_orig < ps_in_trans:
-                    lines.append(f"  → You have {ps_in_trans - ps_in_orig} TOO MANY <ps> marker(s)!")
-                    lines.append(f"  → Remove extra <ps> markers — count must be exactly {ps_in_orig}.")
-                else:
-                    lines.append(f"  → <ps> count matches but paragraph structure still differs.")
-                    lines.append(f"  → Check that <ps> markers are placed at correct boundaries.")
-                lines.append(f"  → <ps> markers are the ONLY way to indicate paragraph breaks here.")
-            else:
-                if orig_count > trans_count:
-                    lines.append(f"  → Translation is MISSING {orig_count - trans_count} paragraph(s)!")
-                    lines.append(f"  → Use newlines (\\n or \\n\\n) to split translation into {orig_count} parts.")
-                else:
-                    lines.append(f"  → Translation has {trans_count - orig_count} TOO MANY paragraph(s)!")
-                    lines.append(f"  → Merge paragraphs so translation has exactly {orig_count} part(s).")
-                lines.append(f"  → MUST match paragraph count exactly!")
+        elif flag_key == 'unexpected_html':
+            lines.append("  ❌ Raw HTML tags found in output")
+            lines.append(f"     Tags: {', '.join(flag_value) if isinstance(flag_value, list) else str(flag_value)}")
+            lines.append("     → Use ONLY <p_00>, <p_01> placeholders for formatting")
 
         elif flag_key == 'first_char':
             orig_first_char, orig_desc   = self._get_first_char_details(original)
@@ -982,19 +871,6 @@ class AutoFixManager:
                 lines.append(f"     Original starts with {orig_desc}: '{orig_first_char}'")
                 lines.append(f"     Translation starts with {trans_desc}: '{trans_first_char}'")
                 lines.append(f"  → Fix: Translation should start with {orig_desc}")
-                if is_numbered_list:
-                    match = re.match(r'^(\d+)\.\s+(\w+)', original)
-                    if match:
-                        number = match.group(1)
-                        word   = match.group(2)
-                        lines.append("")
-                        lines.append(f"  💡 CRITICAL HINT: This is a NUMBERED LIST!")
-                        lines.append(f"     Original format: '{number}. {word}'")
-                        lines.append(f"     You MUST keep BOTH parts:")
-                        lines.append(f"       1) Number prefix: '{number}.'")
-                        lines.append(f"       2) Translated word after it")
-                        lines.append(f"     Example: '{number}. YOURWORD'")
-                        lines.append(f"  → DO NOT remove the number '{number}.'!")
             else:
                 lines.append(f"  First character type mismatch")
 
@@ -1006,59 +882,13 @@ class AutoFixManager:
                 lines.append(f"     Original ends with: {orig_last_info['description']}")
                 lines.append(f"     Translation ends with: {trans_last_info['description']}")
                 lines.append(f"  → Fix: Translation should end with {orig_last_info['type']}")
-                if is_numbered_list:
-                    match = re.match(r'^(\d+)\.\s+(\w+)', original)
-                    if match:
-                        number = match.group(1)
-                        word   = match.group(2)
-                        lines.append("")
-                        lines.append(f"  💡 CRITICAL HINT: This is a NUMBERED LIST!")
-                        lines.append(f"     Original format: '{number}. {word}'")
-                        lines.append(f"     You MUST keep BOTH parts:")
-                        lines.append(f"       1) Number prefix: '{number}.'")
-                        lines.append(f"       2) Translated word: '{word}' → 'YOURWORD'")
-                        lines.append(f"     Example: '{number}. YOURWORD'")
-                        lines.append(f"  → DO NOT translate ONLY the number!")
-            else:
-                lines.append(f"  Last character/punctuation mismatch")
-
-        elif flag_key == 'length':
-            orig_clean  = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<ps>', '', original)
-            trans_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<ps>', '', translation)
-            orig_len    = len(orig_clean)
-            trans_len   = len(trans_clean)
-            ratio       = trans_len / max(orig_len, 1)
-            lines.append(f"  ❌ Significant length difference:")
-            lines.append(f"     Original: {orig_len} characters")
-            lines.append(f"     Translation: {trans_len} characters")
-            if ratio > 1:
-                percentage = (ratio - 1) * 100
-                lines.append(f"     Ratio: {ratio:.2f}x (translation is {percentage:.0f}% LONGER)")
-            else:
-                percentage = (1 - ratio) * 100
-                lines.append(f"     Ratio: {ratio:.2f}x (translation is {percentage:.0f}% SHORTER)")
-            lines.append(f"  → Review: Is translation complete? Not too wordy?")
-            if is_numbered_list and ratio < 0.5:
-                lines.append("")
-                lines.append(f"  💡 HINT: Numbered list detected + very short translation!")
-                lines.append(f"     Did you forget to translate the WORD after the number?")
 
         elif flag_key == 'quote_parity':
-            DOUBLE_QUOTES = r'["\u201C\u201D\u201E\u201F\u00AB\u00BB\u301D\u301E\u301F\uFF02]'
-            orig_quotes  = len(re.findall(DOUBLE_QUOTES, original))
-            trans_quotes = len(re.findall(DOUBLE_QUOTES, translation))
-            lines.append(f"  ❌ Unpaired quotation marks:")
-            lines.append(f"     Original: {orig_quotes} quotation mark(s)")
-            lines.append(f"     Translation: {trans_quotes} quotation mark(s) - ODD NUMBER (unpaired!)")
-            lines.append(f"  → Fix: Add or remove ONE quote to make even number")
+            lines.append(f"  ❌ Unpaired quotation marks (odd number)")
+            lines.append(f"  → Add or remove ONE quote to make even number")
 
         elif flag_key == 'untranslated':
-            words           = re.findall(r'[^\W\d_]+', original, re.UNICODE)
-            lowercase_words = [w for w in words if w[0].islower()]
-            ratio           = len(lowercase_words) / max(len(words), 1)
-            lines.append(f"  ❌ Translation appears identical to original:")
-            lines.append(f"     {len(lowercase_words)}/{len(words)} words start with lowercase")
-            lines.append(f"     ({ratio:.0%} – threshold: >30%)")
+            lines.append(f"  ❌ Translation appears identical to original")
             lines.append(f"  → TRANSLATE the text, do not return it unchanged")
 
         else:
