@@ -877,8 +877,16 @@ class MismatchChecker:
         orig_ps = re.findall(r'<ps>', original)
         trans_ps = re.findall(r'<ps>', translated)
 
-        if not orig_ps:
+        if not orig_ps and not trans_ps:
             return True, None
+
+        if not orig_ps and trans_ps:
+            return False, {
+                'expected': 0,
+                'found': len(trans_ps),
+                'missing': 0,
+                'extra': len(trans_ps),
+            }
 
         if len(orig_ps) == len(trans_ps):
             return True, None
