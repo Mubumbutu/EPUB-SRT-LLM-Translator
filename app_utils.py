@@ -22,7 +22,10 @@ class SessionManager:
         custom_prompts: Dict[str, str],
         single_prompt_mode: bool,
         processing_mode: str,
-        prompt_variant: str
+        prompt_variant: str,
+        json_payload_mode: bool = False,
+        json_payload_template: str = "",
+        json_response_field: str = ""
     ) -> None:
         paragraphs_to_save = []
         for para in paragraphs:
@@ -48,6 +51,9 @@ class SessionManager:
             'custom_assistant_prompt': custom_prompts.get('assistant'),
             'custom_user_prompt': custom_prompts.get('user'),
             'single_prompt_mode': single_prompt_mode,
+            'json_payload_mode': json_payload_mode,
+            'json_payload_template': json_payload_template,
+            'json_response_field': json_response_field,
 
             'metadata': {
                 'processing_mode': processing_mode,
@@ -112,6 +118,9 @@ class SessionManager:
                 'temperature': session_data.get('temperature', 0.8),
                 'custom_prompts': custom_prompts,
                 'single_prompt_mode': session_data.get('single_prompt_mode', False),
+                'json_payload_mode': session_data.get('json_payload_mode', False),
+                'json_payload_template': session_data.get('json_payload_template', ''),
+                'json_response_field': session_data.get('json_response_field', ''),
                 'metadata': {
                     'processing_mode': processing_mode,
                     'prompt_variant': prompt_variant,
@@ -173,6 +182,8 @@ class AppSettingsManager:
 
     DEFAULT_SETTINGS = {
         "llm_choice": "LM Studio",
+        "server_url": "",
+        "json_response_field": "",
         "ollama_model_name": "",
         "openrouter_api_key": "",
         "openrouter_model_name": "",
@@ -202,10 +213,9 @@ class AppSettingsManager:
             "position_shift_threshold": 0.15,
             "inline_position_shift_threshold": 0.30,
         },
-
         "alignment_settings": {
             "device":     "cpu",
-            "model_name": "bert-base-multilingual-cased",
+            "model_name": "xlm-roberta-base",
         },
     }
 
@@ -410,6 +420,18 @@ class PromptManager:
         else:
             result['ollama'] = PromptManager.get_default_ollama_prompt(variant)
 
+        json_payload_file = f"llm_prompt_json_payload_{variant}.txt"
+        if os.path.exists(json_payload_file):
+            try:
+                with open(json_payload_file, 'r', encoding='utf-8') as f:
+                    result['json_payload'] = f.read().strip()
+                logger.info(f"Loaded JSON payload template: {json_payload_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load {json_payload_file}: {e}, using factory")
+                result['json_payload'] = PromptManager.get_default_json_payload_prompt(variant)
+        else:
+            result['json_payload'] = PromptManager.get_default_json_payload_prompt(variant)
+
         return result
 
     @staticmethod
@@ -533,6 +555,76 @@ Return format:
 {user}"""
 
     @staticmethod
+    def get_default_json_payload_prompt(variant: str) -> str:
+        base_instructions = (
+            "Translate the following text to Polish.\\n"
+            "Return ONLY valid JSON in this format: {\\\"translation\\\":\\\"...\\\"}\\n"
+            "Do not add explanations, comments or alternatives.\\n\\n"
+        )
+
+        if variant == "txt":
+            variant_instructions = (
+                "Preserve natural paragraph breaks and text structure.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n"
+                "Maintain the author's meaning and natural Polish flow.\\n\\n"
+            )
+
+        elif variant == "srt":
+            variant_instructions = (
+                "LINE PRESERVATION: maintain line breaks (\\\\n) from the original.\\n"
+                "If the original has 2 lines, the translation must have 2 lines.\\n"
+                "Keep dialogue dashes (- ) at line start if present in original.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+            )
+
+        elif variant == "epub_legacy":
+            variant_instructions = (
+                "RESERVE ELEMENTS — copy exactly, keep approximate position:\\n"
+                "  <id_00>, <id_01>, ... — images, <br> tags, non-translatable elements.\\n"
+                "Do NOT modify or remove them.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+            )
+
+        elif variant == "epub_inline":
+            variant_instructions = (
+                "PLACEHOLDERS — copy all exactly and preserve their positions:\\n"
+                "  <id_00>, <id_01>... — images/<br>/structural (do NOT modify)\\n"
+                "  <p_00>...</p_00>... — inline formatting (<i>/<b>/etc.); every opening needs matching closing\\n"
+                "  <nt_00/>, <nt_01/>... — non-translatable anchors (self-closing, do NOT move)\\n"
+                "  <ps> — paragraph break; count in translation must match original EXACTLY\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+            )
+
+        else:
+            variant_instructions = ""
+
+        content = (
+            base_instructions
+            + variant_instructions
+            + "Context before (for reference only, do NOT translate):\\n"
+            "{context_before}\\n\\n"
+            "Text to translate:\\n"
+            "{core_text}\\n\\n"
+            "Context after (for reference only, do NOT translate):\\n"
+            "{context_after}"
+        )
+
+        return (
+            '{\n'
+            '    "messages": [\n'
+            '        {\n'
+            '            "role": "user",\n'
+            f'            "content": "{content}"\n'
+            '        }\n'
+            '    ]\n'
+            '}'
+        )
+
+    @staticmethod
+    def get_default_json_response_field(variant: str) -> str:
+        return ""
+
+    @staticmethod
     def save_prompts_for_variant(
         variant: str,
         system: str = None,
@@ -583,7 +675,8 @@ Return format:
             f"llm_prompt_system_{variant}.txt",
             f"llm_prompt_assistant_{variant}.txt",
             f"llm_prompt_user_{variant}.txt",
-            f"llm_prompt_ollama_{variant}.txt"
+            f"llm_prompt_ollama_{variant}.txt",
+            f"llm_prompt_json_payload_{variant}.txt",
         ]
 
         deleted_count = 0
