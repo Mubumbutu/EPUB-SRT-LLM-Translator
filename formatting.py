@@ -335,6 +335,21 @@ class MismatchChecker:
         threshold = self.thresholds.get("untranslated_ratio", 0.3)
         return ratio > threshold
 
+    def _detect_raw_html_and_drift(self, orig: str, trans_raw: str, trans: str) -> Dict:
+        flags = {}
+        unexpected = re.findall(r'</?([a-zA-Z][^>\s]*)[^>]*>', trans_raw)
+        allowed = {'p', 'id', 'nt', 'ps', 'translated', 'translation'}
+        bad_tags = [t for t in unexpected if t.lower() not in allowed]
+        if bad_tags:
+            flags["unexpected_html"] = bad_tags
+        orig_words = set(re.findall(r'\b\w+\b', orig.lower()))
+        trans_words = set(re.findall(r'\b\w+\b', trans.lower()))
+        if orig_words and len(trans) > len(orig) * 1.6:
+            overlap = len(orig_words & trans_words) / len(orig_words)
+            if overlap < 0.40:
+                flags["content_drift"] = True
+        return flags
+
     def _check_mismatch_inline(self, para: Dict) -> Tuple[bool, Dict]:
         if para.get("ignore_mismatch", False):
             return False, {}
@@ -425,14 +440,18 @@ class MismatchChecker:
             mismatch_flags["last_char"] = True
 
         if self.checks.get("length", True):
-            length_flag = self._dynamic_length_mismatch(orig, trans)
+            orig_len = len(orig.strip())
+            trans_len = len(trans.strip())
+            if orig_len < 80:
+                length_flag = trans_len > orig_len * 1.75
+            else:
+                length_flag = trans_len > orig_len * 2.5
             if length_flag:
-                orig_words  = len(orig.split())
-                trans_words = len(trans.split())
-                if 0.5 <= trans_words / max(orig_words, 1) <= 3.0:
-                    length_flag = False
-            if length_flag:
-                mismatch_flags["length"] = True
+                mismatch_flags["length"] = {
+                    "orig_chars": orig_len,
+                    "trans_chars": trans_len,
+                    "ratio": round(trans_len / max(orig_len, 1), 2)
+                }
 
         if self.checks.get("quote_parity", True) and check_quote_parity(orig, trans):
             mismatch_flags["quote_parity"] = True
@@ -451,6 +470,15 @@ class MismatchChecker:
 
         if not ps_ok and self.checks.get("ps_markers", True):
             mismatch_flags["ps_markers"] = ps_errors
+
+        extra_flags = self._detect_raw_html_and_drift(orig, trans_raw, trans)
+        for key, value in extra_flags.items():
+            if key == "unexpected_html":
+                if "inline_formatting" not in mismatch_flags:
+                    mismatch_flags["inline_formatting"] = {}
+                mismatch_flags["inline_formatting"]["unexpected_tags"] = value
+            else:
+                mismatch_flags[key] = value
 
         has_mismatch = any(mismatch_flags.values())
         return has_mismatch, mismatch_flags
