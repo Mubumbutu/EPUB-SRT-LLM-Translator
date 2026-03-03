@@ -7,7 +7,6 @@ import time
 import threading
 from abc import ABC, abstractmethod
 from openrouter import OpenRouter
-from openrouter.errors.chaterror import ChatError
 from typing import Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -189,20 +188,14 @@ class OpenRouterClient(LLMClient):
                 time.sleep(wait_needed)
 
     def _is_rate_limit_error(self, e: Exception) -> bool:
-        try:
-            if isinstance(e, ChatError):
-                if hasattr(e, 'http_res') and e.http_res is not None:
-                    if e.http_res.status_code == 429:
+        for attr in ('http_res', 'raw_response', 'response'):
+            obj = getattr(e, attr, None)
+            if obj is not None:
+                try:
+                    if getattr(obj, 'status_code', None) == 429:
                         return True
-
-                if hasattr(e, 'raw_response') and e.raw_response is not None:
-                    try:
-                        if e.raw_response.status_code == 429:
-                            return True
-                    except Exception:
-                        pass
-        except ImportError:
-            pass
+                except Exception:
+                    pass
 
         err_str = str(e)
         return (
@@ -1553,7 +1546,3 @@ def build_context_section(
         return "\n\n".join(texts)
 
     return build_text(context_before), build_text(context_after)
-
-
-
-
