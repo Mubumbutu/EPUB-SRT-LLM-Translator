@@ -923,6 +923,48 @@ class TranslatorApp(QMainWindow):
         self.single_prompt_checkbox.setStyleSheet(CHECKBOX_STYLE)
         editor_header_layout.addWidget(self.single_prompt_checkbox)
 
+        self.json_payload_checkbox = QCheckBox("JSON Payload mode")
+        self.json_payload_checkbox.setToolTip(
+            "Send a raw JSON payload instead of chat messages.\n"
+            "Use for models that require a custom JSON input format.\n\n"
+            "Available variables:\n"
+            "  {core_text}       — text to translate\n"
+            "  {context_before}  — previous paragraphs (for context)\n"
+            "  {context_after}   — following paragraphs (for context)\n\n"
+            "Temperature is injected automatically from the UI slider.\n"
+            "Do not include 'temperature' in the template.\n\n"
+            "Response field (leave empty for auto-detect):\n"
+            "  translation                     → {\"translation\": \"...\"}\n"
+            "  choices.0.message.content       → standard chat response\n"
+            "  choices.0.message.content.translation → JSON inside content"
+        )
+        self.json_payload_checkbox.setStyleSheet(CHECKBOX_STYLE)
+        self.json_payload_checkbox.stateChanged.connect(self._on_json_payload_toggled)
+        editor_header_layout.addWidget(self.json_payload_checkbox)
+
+        self.json_response_field_label = QLabel("Response field:")
+        self.json_response_field_label.setStyleSheet(
+            "color: #999; font-size: 11px; background: transparent; border: none;"
+        )
+        self.json_response_field_label.setVisible(False)
+        editor_header_layout.addWidget(self.json_response_field_label)
+
+        self.json_response_field_edit = QLineEdit()
+        self.json_response_field_edit.setPlaceholderText("leave empty to auto-detect")
+        self.json_response_field_edit.setFixedWidth(160)
+        self.json_response_field_edit.setToolTip(
+            "JSON path to extract the translation from the server response.\n"
+            "Supports dot notation and traversal through JSON strings.\n\n"
+            "Examples:\n"
+            "  translation                          → {\"translation\": \"...\"}\n"
+            "  choices.0.message.content            → standard chat content\n"
+            "  choices.0.message.content.translation → JSON string inside content\n\n"
+            "Leave empty to auto-detect common keys:\n"
+            "translation, Translation, text, result, output, translated"
+        )
+        self.json_response_field_edit.setVisible(False)
+        editor_header_layout.addWidget(self.json_response_field_edit)
+
         self.btn_hard_reset = QPushButton("🗑  Hard Reset")
         self.btn_hard_reset.setToolTip("Permanently deletes your instruction files and restores factory defaults.")
         self.btn_hard_reset.setStyleSheet(f"background-color: #880000; {EDITOR_BTN}")
@@ -1275,6 +1317,16 @@ class TranslatorApp(QMainWindow):
         self.llm_choice_combo.setStyleSheet(COMBO_STYLE)
         self.llm_choice_combo.currentTextChanged.connect(self.update_model_name_visibility)
         engine_form.addRow(form_label("Select LLM:"), self.llm_choice_combo)
+
+        self.server_url_label = form_label("Server URL:")
+        self.server_url_edit = QLineEdit()
+        self.server_url_edit.setPlaceholderText("e.g., http://localhost:1234/v1/chat/completions")
+        self.server_url_edit.setStyleSheet(INPUT_STYLE)
+        self.server_url_edit.setToolTip(
+            "Custom endpoint URL for LM Studio, Lemonade, or any OpenAI-compatible server.\n"
+            "Leave empty to use the default: http://localhost:1234/v1/chat/completions"
+        )
+        engine_form.addRow(self.server_url_label, self.server_url_edit)
 
         self.ollama_model_label = form_label("Ollama Model Name:")
         self.ollama_model_edit = QLineEdit()
@@ -1916,6 +1968,7 @@ class TranslatorApp(QMainWindow):
 
         current_llm = self.app_settings.get("llm_choice", "LM Studio")
         self.llm_choice_combo.setCurrentText(current_llm)
+        self.server_url_edit.setText(self.app_settings.get("server_url", ""))
         self.ollama_model_edit.setText(self.app_settings.get("ollama_model_name", ""))
         self.openrouter_api_key_edit.setText(self.app_settings.get("openrouter_api_key", ""))
         self.openrouter_model_edit.setText(self.app_settings.get("openrouter_model_name", ""))
@@ -2235,6 +2288,19 @@ class TranslatorApp(QMainWindow):
 
             single_prompt_mode = self.single_prompt_checkbox.isChecked()
 
+            json_payload_mode = self.json_payload_checkbox.isChecked()
+            json_payload_template = ""
+            json_response_field = ""
+
+            if json_payload_mode:
+                if hasattr(self, 'json_payload_edit'):
+                    json_payload_template = self.json_payload_edit.toPlainText().strip()
+                elif variant and variant in self.current_prompts_cache:
+                    json_payload_template = self.current_prompts_cache[variant].get('json_payload', '')
+                else:
+                    json_payload_template = getattr(self, '_json_payload_content', '')
+                json_response_field = self.json_response_field_edit.text().strip()
+
             SessionManager.save_session(
                 path=path,
                 paragraphs=self.paragraphs,
@@ -2247,7 +2313,10 @@ class TranslatorApp(QMainWindow):
                 custom_prompts=custom_prompts,
                 single_prompt_mode=single_prompt_mode,
                 processing_mode=processing_mode,
-                prompt_variant=variant
+                prompt_variant=variant,
+                json_payload_mode=json_payload_mode,
+                json_payload_template=json_payload_template,
+                json_response_field=json_response_field
             )
 
             self.show_message("Success", f"Session saved to file:\n{path}")
@@ -2339,6 +2408,35 @@ class TranslatorApp(QMainWindow):
 
                 logger.info(f"Loaded custom prompts from session into cache: {variant}")
 
+            json_payload_mode = session_data.get('json_payload_mode', False)
+            json_payload_template = session_data.get('json_payload_template', '')
+            json_response_field = session_data.get('json_response_field', '')
+
+            if json_payload_mode and json_payload_template:
+                if variant not in self.current_prompts_cache:
+                    self.current_prompts_cache[variant] = {}
+                self.current_prompts_cache[variant]['json_payload'] = json_payload_template
+                self._json_payload_content = json_payload_template
+
+                self.app_settings['json_response_field'] = json_response_field
+
+                self.json_payload_checkbox.blockSignals(True)
+                self.json_payload_checkbox.setChecked(True)
+                self.json_payload_checkbox.blockSignals(False)
+
+                self.json_response_field_edit.setText(json_response_field)
+                self.json_response_field_label.setVisible(True)
+                self.json_response_field_edit.setVisible(True)
+
+                logger.info(f"Loaded JSON payload mode from session: {variant}")
+            else:
+                self.json_payload_checkbox.blockSignals(True)
+                self.json_payload_checkbox.setChecked(False)
+                self.json_payload_checkbox.blockSignals(False)
+
+                self.json_response_field_label.setVisible(False)
+                self.json_response_field_edit.setVisible(False)
+
             self.file_processor = FileProcessorFactory.create_processor(
                 self.file_type,
                 self.app_settings
@@ -2353,7 +2451,6 @@ class TranslatorApp(QMainWindow):
                         raise ValueError("Failed to load EPUB book object")
 
                     logger.info(f"✓ EPUB book object restored (needed for saving)")
-
                     self._remap_session_paragraph_ids(file_paragraphs)
 
                 except Exception as e:
@@ -2476,8 +2573,10 @@ class TranslatorApp(QMainWindow):
                     api_key=self.app_settings.get('openrouter_api_key', '')
                 )
             else:
+                custom_url = self.app_settings.get('server_url', '').strip()
                 llm_client = LLMClientFactory.create_client(
-                    llm_choice="LM Studio"
+                    llm_choice="LM Studio",
+                    endpoint=custom_url if custom_url else None
                 )
 
             variant = self._get_current_variant()
@@ -2485,7 +2584,25 @@ class TranslatorApp(QMainWindow):
 
             logger.info(f"Using prompts from cache for variant: {variant}")
 
-            if llm_choice == "Ollama":
+            is_json_payload = self.json_payload_checkbox.isChecked()
+
+            if is_json_payload and hasattr(self, 'json_payload_edit'):
+                json_template = self.json_payload_edit.toPlainText().strip()
+                json_response_field = self.json_response_field_edit.text().strip()
+                prompt_builder = PromptBuilder(
+                    variant=variant,
+                    json_payload_template=json_template,
+                    json_response_field=json_response_field
+                )
+            elif is_json_payload and getattr(self, '_json_payload_content', None):
+                json_template = self._json_payload_content
+                json_response_field = self.json_response_field_edit.text().strip()
+                prompt_builder = PromptBuilder(
+                    variant=variant,
+                    json_payload_template=json_template,
+                    json_response_field=json_response_field
+                )
+            elif llm_choice == "Ollama":
                 prompt_builder = PromptBuilder(
                     variant=variant,
                     ollama_template=prompts['ollama'],
@@ -3974,6 +4091,10 @@ class TranslatorApp(QMainWindow):
             self.update_llm_editor_content()
             has_file = bool(self.original_file_path)
             self.single_prompt_checkbox.setVisible(has_file)
+            self.json_payload_checkbox.setVisible(has_file)
+            is_json = self.json_payload_checkbox.isChecked()
+            self.json_response_field_label.setVisible(has_file and is_json)
+            self.json_response_field_edit.setVisible(has_file and is_json)
 
     def update_llm_editor_content(self):
         for i in reversed(range(self.llm_editor_layout.count())):
@@ -3988,15 +4109,55 @@ class TranslatorApp(QMainWindow):
             label.setStyleSheet("color: #888; padding: 20px;")
             self.llm_editor_layout.addWidget(label)
 
-            if hasattr(self, 'ollama_prompt_edit'):
-                delattr(self, 'ollama_prompt_edit')
-            if hasattr(self, 'system_prompt_edit'):
-                delattr(self, 'system_prompt_edit')
-            if hasattr(self, 'assistant_prompt_edit'):
-                delattr(self, 'assistant_prompt_edit')
-            if hasattr(self, 'user_prompt_edit'):
-                delattr(self, 'user_prompt_edit')
+            for attr in ('ollama_prompt_edit', 'system_prompt_edit',
+                         'assistant_prompt_edit', 'user_prompt_edit', 'json_payload_edit'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            return
 
+        if self.json_payload_checkbox.isChecked():
+            info_label = QLabel("JSON Payload Template  —  available variables: {core_text}  {context_before}  {context_after}")
+            info_label.setStyleSheet("font-weight: bold; color: #cc8800;")
+            self.llm_editor_layout.addWidget(info_label)
+
+            self.json_payload_edit = QTextEdit()
+            self.json_payload_edit.setMinimumHeight(400)
+
+            variant = self._get_current_variant()
+            cached_template = ""
+
+            if variant and variant in self.current_prompts_cache:
+                cached_template = self.current_prompts_cache[variant].get('json_payload', '')
+            elif variant:
+                loaded = self.prompt_manager.load_prompts_for_variant(variant)
+                cached_template = loaded.get('json_payload', '')
+
+            if not cached_template:
+                cached_template = getattr(self, '_json_payload_content', '')
+
+            if cached_template:
+                self.json_payload_edit.setPlainText(cached_template)
+            else:
+                self.json_payload_edit.setPlainText(
+                    self.prompt_manager.get_default_json_payload_prompt(variant or '')
+                )
+
+            cached_response_field = self.app_settings.get('json_response_field', '')
+            if cached_response_field:
+                self.json_response_field_edit.setText(cached_response_field)
+
+            try:
+                self.json_payload_edit.textChanged.disconnect()
+            except:
+                pass
+
+            self.json_payload_edit.textChanged.connect(self.on_json_payload_content_changed)
+            self.llm_editor_layout.addWidget(self.json_payload_edit)
+
+            for attr in ('ollama_prompt_edit', 'system_prompt_edit',
+                         'assistant_prompt_edit', 'user_prompt_edit'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
             return
 
         variant = self._get_current_variant()
@@ -4011,7 +4172,6 @@ class TranslatorApp(QMainWindow):
 
             self.ollama_prompt_edit = QTextEdit()
             self.ollama_prompt_edit.setMinimumHeight(400)
-
             self.ollama_prompt_edit.setPlainText(prompts['ollama'])
 
             try:
@@ -4022,12 +4182,11 @@ class TranslatorApp(QMainWindow):
             self.ollama_prompt_edit.textChanged.connect(self.on_ollama_prompt_changed)
             self.llm_editor_layout.addWidget(self.ollama_prompt_edit)
 
-            if hasattr(self, 'system_prompt_edit'):
-                delattr(self, 'system_prompt_edit')
-            if hasattr(self, 'assistant_prompt_edit'):
-                delattr(self, 'assistant_prompt_edit')
-            if hasattr(self, 'user_prompt_edit'):
-                delattr(self, 'user_prompt_edit')
+            for attr in ('system_prompt_edit', 'assistant_prompt_edit',
+                         'user_prompt_edit', 'json_payload_edit'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+
         else:
             splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -4037,17 +4196,13 @@ class TranslatorApp(QMainWindow):
             system_label = QLabel("System Prompt:")
             system_label.setStyleSheet("font-weight: bold; color: #0066cc;")
             system_layout.addWidget(system_label)
-
             self.system_prompt_edit = QTextEdit()
             self.system_prompt_edit.setMinimumHeight(400)
-
             self.system_prompt_edit.setPlainText(prompts['system'])
-
             try:
                 self.system_prompt_edit.textChanged.disconnect()
             except:
                 pass
-
             self.system_prompt_edit.textChanged.connect(self.on_system_prompt_changed)
             system_layout.addWidget(self.system_prompt_edit)
             splitter.addWidget(system_container)
@@ -4058,17 +4213,13 @@ class TranslatorApp(QMainWindow):
             assistant_label = QLabel("Assistant Instruction / Context:")
             assistant_label.setStyleSheet("font-weight: bold; color: #009900;")
             assistant_layout.addWidget(assistant_label)
-
             self.assistant_prompt_edit = QTextEdit()
             self.assistant_prompt_edit.setMinimumHeight(400)
-
             self.assistant_prompt_edit.setPlainText(prompts['assistant'])
-
             try:
                 self.assistant_prompt_edit.textChanged.disconnect()
             except:
                 pass
-
             self.assistant_prompt_edit.textChanged.connect(self.on_assistant_prompt_changed)
             assistant_layout.addWidget(self.assistant_prompt_edit)
             splitter.addWidget(assistant_container)
@@ -4079,25 +4230,22 @@ class TranslatorApp(QMainWindow):
             user_label = QLabel("User Prompt:")
             user_label.setStyleSheet("font-weight: bold; color: #cc6600;")
             user_layout.addWidget(user_label)
-
             self.user_prompt_edit = QTextEdit()
             self.user_prompt_edit.setMinimumHeight(400)
-
             self.user_prompt_edit.setPlainText(prompts['user'])
-
             try:
                 self.user_prompt_edit.textChanged.disconnect()
             except:
                 pass
-
             self.user_prompt_edit.textChanged.connect(self.on_user_prompt_changed)
             user_layout.addWidget(self.user_prompt_edit)
             splitter.addWidget(user_container)
 
             self.llm_editor_layout.addWidget(splitter)
 
-            if hasattr(self, 'ollama_prompt_edit'):
-                delattr(self, 'ollama_prompt_edit')
+            for attr in ('ollama_prompt_edit', 'json_payload_edit'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
 
     def on_ollama_prompt_changed(self):
         if not hasattr(self, 'ollama_prompt_edit'):
@@ -4159,6 +4307,19 @@ class TranslatorApp(QMainWindow):
 
         logger.debug(f"User prompt updated in cache (variant: {variant})")
 
+    def _on_json_payload_toggled(self, state):
+        is_json = bool(state)
+        self.json_response_field_label.setVisible(is_json)
+        self.json_response_field_edit.setVisible(is_json)
+        if self.llm_editor_container.isVisible():
+            self.update_llm_editor_content()
+
+    def on_json_payload_content_changed(self):
+        if not hasattr(self, 'json_payload_edit'):
+            return
+        self._json_payload_content = self.json_payload_edit.toPlainText()
+        logger.debug("JSON payload template updated in memory")
+
     def save_llm_instruction(self):
         variant = self._get_current_variant()
         if not variant:
@@ -4166,6 +4327,28 @@ class TranslatorApp(QMainWindow):
             return
 
         try:
+            if self.json_payload_checkbox.isChecked():
+                if not hasattr(self, 'json_payload_edit'):
+                    self.show_message("No Changes", "No JSON payload template to save.", QMessageBox.Icon.Warning)
+                    return
+
+                template = self.json_payload_edit.toPlainText().strip()
+                response_field = self.json_response_field_edit.text().strip()
+
+                self.prompt_manager.save_prompt(variant, 'json_payload', template)
+
+                if variant not in self.current_prompts_cache:
+                    self.current_prompts_cache[variant] = {}
+                self.current_prompts_cache[variant]['json_payload'] = template
+                self._json_payload_content = template
+
+                self.app_settings['json_response_field'] = response_field
+                AppSettingsManager.save_settings(self.app_settings)
+
+                logger.info(f"Saved JSON payload template to file and response_field to settings: {variant}")
+                self.show_message("Success", f"JSON payload template saved for: {variant}")
+                return
+
             if variant not in self.current_prompts_cache:
                 self.show_message("No Changes", "No prompts in cache to save.", QMessageBox.Icon.Warning)
                 return
@@ -4218,11 +4401,16 @@ class TranslatorApp(QMainWindow):
                 'system': self.prompt_manager.get_default_system_prompt(variant),
                 'assistant': self.prompt_manager.get_default_assistant_prompt(variant),
                 'user': self.prompt_manager.get_default_user_prompt(variant),
-                'ollama': self.prompt_manager.get_default_ollama_prompt(variant)
+                'ollama': self.prompt_manager.get_default_ollama_prompt(variant),
+                'json_payload': '',
             }
 
-            logger.info(f"Reset prompts to factory defaults in cache: {variant}")
+            self._json_payload_content = ''
+            self.json_response_field_edit.setText('')
+            self.app_settings['json_response_field'] = ''
+            self.json_payload_checkbox.setChecked(False)
 
+            logger.info(f"Reset prompts to factory defaults in cache: {variant}")
             self.update_llm_editor_content()
 
             self.show_message(
@@ -4259,8 +4447,14 @@ class TranslatorApp(QMainWindow):
                 'system': self.prompt_manager.get_default_system_prompt(variant),
                 'assistant': self.prompt_manager.get_default_assistant_prompt(variant),
                 'user': self.prompt_manager.get_default_user_prompt(variant),
-                'ollama': self.prompt_manager.get_default_ollama_prompt(variant)
+                'ollama': self.prompt_manager.get_default_ollama_prompt(variant),
+                'json_payload': '',
             }
+
+            self._json_payload_content = ''
+            self.json_response_field_edit.setText('')
+            self.app_settings['json_response_field'] = ''
+            self.json_payload_checkbox.setChecked(False)
 
             self.update_llm_editor_content()
 
@@ -4274,6 +4468,7 @@ class TranslatorApp(QMainWindow):
         try:
             settings = self.app_settings.copy()
             settings["llm_choice"] = self.llm_choice_combo.currentText()
+            settings["server_url"] = self.server_url_edit.text().strip()
             if settings["llm_choice"] == "Ollama":
                 settings["ollama_model_name"] = self.ollama_model_edit.text()
             elif settings["llm_choice"] == "Openrouter":
@@ -4420,7 +4615,10 @@ class TranslatorApp(QMainWindow):
     def update_model_name_visibility(self, llm_choice):
         is_ollama = llm_choice == "Ollama"
         is_openrouter = llm_choice == "Openrouter"
+        is_local = llm_choice == "LM Studio"
 
+        self.server_url_label.setVisible(is_local)
+        self.server_url_edit.setVisible(is_local)
         self.ollama_model_label.setVisible(is_ollama)
         self.ollama_model_edit.setVisible(is_ollama)
         self.openrouter_api_key_label.setVisible(is_openrouter)
