@@ -558,8 +558,8 @@ Return format:
     def get_default_json_payload_prompt(variant: str) -> str:
         base_instructions = (
             "Translate the following text to Polish.\\n"
-            "Return ONLY valid JSON in this format: {\\\"translation\\\":\\\"...\\\"}\\n"
-            "Do not add explanations, comments or alternatives.\\n\\n"
+            "Return ONLY valid JSON in this exact format: {\\\"translation\\\":\\\"...\\\"}\\n"
+            "Do not add any explanations, comments, markdown or extra text outside the JSON.\\n\\n"
         )
 
         if variant == "txt":
@@ -572,7 +572,7 @@ Return format:
         elif variant == "srt":
             variant_instructions = (
                 "LINE PRESERVATION: maintain line breaks (\\\\n) from the original.\\n"
-                "If the original has 2 lines, the translation must have 2 lines.\\n"
+                "If the original has 2 lines, the translation must have exactly 2 lines.\\n"
                 "Keep dialogue dashes (- ) at line start if present in original.\\n"
                 "Keep URLs, emails and proper nouns as-is.\\n\\n"
             )
@@ -592,15 +592,25 @@ Return format:
                 "  <p_00>...</p_00>... — inline formatting (<i>/<b>/etc.); every opening needs matching closing\\n"
                 "  <nt_00/>, <nt_01/>... — non-translatable anchors (self-closing, do NOT move)\\n"
                 "  <ps> — paragraph break; count in translation must match original EXACTLY\\n"
+                "NEVER use raw HTML tags like <i>, <b>, <em> — use only <p_XX> placeholders.\\n"
                 "Keep URLs, emails and proper nouns as-is.\\n\\n"
             )
 
         else:
             variant_instructions = ""
 
+        auto_fix_ready = (
+            "IMPORTANT: You may receive additional instructions starting with:\\n"
+            "=== AUTO-FIX INSTRUCTIONS - CRITICAL ===\\n"
+            "If you see them, you MUST fix the listed issues in your previous translation.\\n"
+            "Then return the corrected translation in the exact same JSON format.\\n"
+            "Do not mention the auto-fix instructions in your response.\\n\\n"
+        )
+
         content = (
             base_instructions
             + variant_instructions
+            + auto_fix_ready
             + "Context before (for reference only, do NOT translate):\\n"
             "{context_before}\\n\\n"
             "Text to translate:\\n"
