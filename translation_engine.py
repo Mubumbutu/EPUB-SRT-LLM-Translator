@@ -40,16 +40,10 @@ class LMStudioClient(LLMClient):
 
     def translate(
         self,
-        prompt: List[Dict],
+        prompt,
         temperature: float,
         timeout_seconds: int
     ) -> str:
-        payload = {
-            "messages": prompt,
-            "temperature": temperature,
-            "max_tokens": -1,
-            "stream": False
-        }
         headers = {"Content-Type": "application/json"}
 
         session = requests.Session()
@@ -57,21 +51,132 @@ class LMStudioClient(LLMClient):
             self._active_session = session
 
         try:
-            logger.debug(f"LM Studio request: temp={temperature}, timeout={timeout_seconds}s")
-            response = session.post(
-                self.endpoint,
-                json=payload,
-                headers=headers,
-                timeout=timeout_seconds
-            )
-            response.raise_for_status()
-            data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if not content:
-                logger.warning("LM Studio returned empty content")
-                return ""
-            logger.debug(f"LM Studio response: {len(content)} chars")
-            return content
+            if isinstance(prompt, dict) and "__json_payload__" in prompt:
+                payload = prompt["__json_payload__"]
+                response_field = prompt.get("__response_field__", "").strip()
+
+                payload["temperature"] = temperature
+
+                logger.debug(f"JSON payload request: timeout={timeout_seconds}s, response_field='{response_field}'")
+
+                response = session.post(
+                    self.endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout_seconds
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if response_field:
+                    try:
+                        parts = response_field.split(".")
+                        val = data
+                        for part in parts:
+                            if isinstance(val, str):
+                                try:
+                                    val = json.loads(val)
+                                except (json.JSONDecodeError, ValueError):
+                                    pass
+                            if isinstance(val, list):
+                                val = val[int(part)]
+                            else:
+                                val = val[part]
+                        if isinstance(val, str):
+                            content = val.strip()
+                        else:
+                            content = json.dumps(val, ensure_ascii=False).strip()
+                    except (KeyError, IndexError, ValueError, TypeError) as e:
+                        raw = json.dumps(data)[:400]
+                        raise ValueError(
+                            f"Could not extract field '{response_field}' from server response.\n"
+                            f"Check the 'Response field' setting.\n"
+                            f"Raw response: {raw}"
+                        )
+                else:
+                    choices = data.get("choices", [])
+                    if choices:
+                        raw_content = choices[0].get("message", {}).get("content", "")
+                    else:
+                        raw_content = (
+                            data.get("response", "")
+                            or data.get("translation", "")
+                            or data.get("text", "")
+                        )
+
+                    if raw_content:
+                        stripped = raw_content.strip()
+                        if stripped.startswith("{") and stripped.endswith("}"):
+                            try:
+                                parsed = json.loads(stripped)
+                                translation_keys = [
+                                    "translation", "Translation", "TRANSLATION",
+                                    "text", "Text", "result", "Result",
+                                    "output", "Output", "translated", "Translated"
+                                ]
+                                extracted = None
+                                for k in translation_keys:
+                                    if k in parsed:
+                                        extracted = str(parsed[k]).strip()
+                                        break
+                                content = extracted if extracted else stripped
+                            except (json.JSONDecodeError, ValueError):
+                                content = stripped
+                        else:
+                            content = stripped
+                    else:
+                        content = ""
+
+                if not content:
+                    raw = json.dumps(data)[:400]
+                    raise ValueError(
+                        f"Server returned 200 OK but the extracted content is empty.\n"
+                        f"Check the 'Response field' setting or verify the model output format.\n"
+                        f"Raw response: {raw}"
+                    )
+
+                logger.debug(f"JSON payload response: {len(content)} chars")
+                return content
+
+            else:
+                payload = {
+                    "messages": prompt,
+                    "temperature": temperature,
+                    "max_tokens": -1,
+                    "stream": False
+                }
+
+                logger.debug(f"LM Studio request: temp={temperature}, timeout={timeout_seconds}s")
+
+                response = session.post(
+                    self.endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout_seconds
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                choices = data.get("choices", [])
+                if not choices:
+                    raw = json.dumps(data)[:400]
+                    raise ValueError(
+                        f"Server returned 200 OK but 'choices' is empty or missing.\n"
+                        f"Possible cause: model is not loaded or the server does not support the chat/completions endpoint.\n"
+                        f"Raw response: {raw}"
+                    )
+
+                content = choices[0].get("message", {}).get("content", "")
+                if not content:
+                    raw = json.dumps(data)[:400]
+                    raise ValueError(
+                        f"Server returned 200 OK but 'content' is empty.\n"
+                        f"Make sure the model is fully loaded and supports the chat/completions format.\n"
+                        f"Raw response: {raw}"
+                    )
+
+                logger.debug(f"LM Studio response: {len(content)} chars")
+                return content
 
         except requests.Timeout:
             logger.error(f"LM Studio timeout after {timeout_seconds}s")
@@ -359,7 +464,9 @@ class PromptBuilder:
         assistant_template: Optional[str] = None,
         user_template: Optional[str] = None,
         ollama_template: Optional[str] = None,
-        single_prompt_mode: bool = False
+        single_prompt_mode: bool = False,
+        json_payload_template: Optional[str] = None,
+        json_response_field: str = ""
     ):
         self.variant = variant
         self.system_template = system_template
@@ -367,8 +474,10 @@ class PromptBuilder:
         self.user_template = user_template
         self.ollama_template = ollama_template
         self.single_prompt_mode = single_prompt_mode
+        self.json_payload_template = json_payload_template
+        self.json_response_field = json_response_field
 
-        logger.info(f"PromptBuilder initialized: variant={variant}, single_prompt={single_prompt_mode}")
+        logger.info(f"PromptBuilder initialized: variant={variant}, single_prompt={single_prompt_mode}, json_payload={bool(json_payload_template)}")
 
     def build_prompt(
         self,
@@ -377,6 +486,26 @@ class PromptBuilder:
         context_after: str = "",
         auto_fix_section: str = ""
     ) -> Union[str, List[Dict]]:
+        if self.json_payload_template is not None:
+            def json_escape(value: str) -> str:
+                return json.dumps(value)[1:-1]
+
+            filled = self.json_payload_template.replace("{core_text}", json_escape(core_text))
+            filled = filled.replace("{context_before}", json_escape(context_before))
+            filled = filled.replace("{context_after}", json_escape(context_after))
+            try:
+                payload_dict = json.loads(filled)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Invalid JSON Payload Template: {e}\n"
+                    f"Check the template in the LLM Instructions Editor."
+                )
+            logger.debug(f"Built JSON payload: {len(filled)} chars")
+            return {
+                "__json_payload__": payload_dict,
+                "__response_field__": self.json_response_field
+            }
+
         if self.ollama_template is not None:
             prompt = self.ollama_template.format(
                 core_text=core_text,
@@ -1137,7 +1266,18 @@ class TranslationOrchestrator:
         logger.info("")
 
     def _restore_paragraph_structure(self, text: str, fragment: Dict) -> str:
+        original_text = fragment.get('original_text', '')
+        import re as _re
+        orig_has_ps = bool(_re.search(r'<ps>', original_text))
+
         if not fragment.get('_had_newlines', False):
+            if not orig_has_ps and '<ps>' in text:
+                cleaned = _re.sub(r'<ps>', '', text).strip()
+                logger.warning(
+                    f"Stripped spurious <ps> from single-part fragment "
+                    f"(original has no paragraph breaks)"
+                )
+                return cleaned
             return text
 
         original_parts = fragment.get('_original_parts', [])
@@ -1145,6 +1285,10 @@ class TranslationOrchestrator:
         n_parts = len(original_parts)
 
         if n_parts <= 1:
+            if not orig_has_ps and '<ps>' in text:
+                cleaned = _re.sub(r'<ps>', '', text).strip()
+                logger.warning("Stripped spurious <ps> from single-part fragment")
+                return cleaned
             return text
 
         text = text.strip()
@@ -1176,11 +1320,12 @@ class TranslationOrchestrator:
                 return result
 
             else:
+                flat = _re.sub(r'<ps>', '', text).strip()
                 logger.warning(
                     f"LLM dropped all <ps> markers (expected {n_parts} parts) "
-                    f"— returning flat text"
+                    f"— returning flat text without spurious <ps>"
                 )
-                return text
+                return flat
 
         else:
             orig_lengths = [len(p.strip()) for p in original_parts]
@@ -1214,48 +1359,25 @@ class TranslationOrchestrator:
 
                 if best_pos is None:
                     fallback = text.find(' ', target_pos)
-                    if fallback != -1:
-                        best_pos = fallback
-                    else:
-                        fallback = text.rfind(' ', prev_split, target_pos)
-                        best_pos = fallback if fallback != -1 else target_pos
+                    best_pos = fallback if fallback != -1 else target_pos
 
                 split_points.append(best_pos)
                 prev_split = best_pos
 
-            trans_parts = []
+            parts = []
             prev = 0
             for sp in split_points:
-                part = text[prev:sp].strip()
-                if part:
-                    trans_parts.append(part)
+                parts.append(text[prev:sp].strip())
                 prev = sp + 1
+            parts.append(text[prev:].strip())
 
-            last_part = text[prev:].strip()
-            if last_part:
-                trans_parts.append(last_part)
+            result = ''
+            for i, part in enumerate(parts):
+                result += part
+                if i < len(original_separators):
+                    result += original_separators[i]
 
-            trans_parts = [p for p in trans_parts if p]
-
-            if len(trans_parts) == n_parts:
-                result = ''
-                for i, part in enumerate(trans_parts):
-                    result += part
-                    if i < len(original_separators):
-                        result += original_separators[i]
-                logger.debug(
-                    f"Restored legacy structure: {n_parts} parts via proportional split"
-                )
-                return result
-
-            else:
-                dominant_sep = original_separators[0] if original_separators else '\n'
-                result = dominant_sep.join(trans_parts)
-                logger.warning(
-                    f"Proportional split mismatch: expected {n_parts} parts, "
-                    f"got {len(trans_parts)} — joining with {repr(dominant_sep)}"
-                )
-                return result
+            return result
 
     def translate_fragment(
         self,
