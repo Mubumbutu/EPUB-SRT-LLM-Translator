@@ -1603,6 +1603,18 @@ class TranslatorApp(QMainWindow):
             "Long (>500)", "length_ratio_long", 1.3, "Texts over 500 chars.\nDefault: 1.30"
         ))
         length_group_layout.addLayout(length_spinboxes_row)
+
+        too_short_row = QHBoxLayout()
+        too_short_row.setSpacing(10)
+        too_short_row.addLayout(make_spinbox_with_label(
+            "Too short (min ratio)", "length_ratio_too_short", 0.45,
+            "Translation is flagged when shorter than this fraction of the original.\n"
+            "e.g. 0.45 means: if translation < 45% of original length → mismatch.\n"
+            "Only applied when original ≥ 8 chars.\nDefault: 0.45",
+            min_val=0.05, max_val=0.95, step=0.05
+        ))
+        too_short_row.addStretch()
+        length_group_layout.addLayout(too_short_row)
         thresholds_layout.addWidget(length_group)
 
         sep_thresh = QFrame()
@@ -1733,6 +1745,7 @@ class TranslatorApp(QMainWindow):
         self.length_ratio_short_spinbox.valueChanged.connect(self._on_mismatch_check_toggled)
         self.length_ratio_medium_spinbox.valueChanged.connect(self._on_mismatch_check_toggled)
         self.length_ratio_long_spinbox.valueChanged.connect(self._on_mismatch_check_toggled)
+        self.length_ratio_too_short_spinbox.valueChanged.connect(self._on_mismatch_check_toggled)
         self.untranslated_ratio_spinbox.valueChanged.connect(self._on_mismatch_check_toggled)
         self.position_shift_threshold_spinbox.valueChanged.connect(self._on_mismatch_check_toggled)
         self.inline_position_shift_threshold_spinbox.valueChanged.connect(self._on_mismatch_check_toggled)
@@ -3190,8 +3203,12 @@ class TranslatorApp(QMainWindow):
             orig_len = len(orig_clean)
             trans_len = len(trans_clean)
             ratio = trans_len / max(orig_len, 1)
+            if ratio < 1.0:
+                direction = "too short"
+            else:
+                direction = "too long"
             structure_issues.append(
-                f"• <b>Length mismatch:</b> {orig_len} → {trans_len} chars "
+                f"• <b>Length mismatch ({direction}):</b> {orig_len} → {trans_len} chars "
                 f"(ratio: {ratio:.2f}x)"
             )
 
@@ -4549,66 +4566,61 @@ class TranslatorApp(QMainWindow):
             )
 
     def save_app_settings(self):
-        try:
-            settings = self.app_settings.copy()
-            settings["llm_choice"] = self.llm_choice_combo.currentText()
-            settings["server_url"] = self.server_url_edit.text().strip()
-            if settings["llm_choice"] == "Ollama":
-                settings["ollama_model_name"] = self.ollama_model_edit.text()
-            elif settings["llm_choice"] == "Openrouter":
-                settings["openrouter_api_key"] = self.openrouter_api_key_edit.text()
-                settings["openrouter_model_name"] = self.openrouter_model_edit.text()
-            settings["deepl_free_api_key"] = self.deepl_free_api_key_edit.text()
-            settings["deepl_pro_api_key"] = self.deepl_pro_api_key_edit.text()
-            settings["use_inline_formatting"] = self.inline_formatting_checkbox.isChecked()
+        if not hasattr(self, 'inline_formatting_checkbox'):
+            return
 
-            settings["restore_paragraph_structure"] = self.restore_paragraph_checkbox.isChecked()
-            settings["show_ps_in_ui"] = self.show_ps_in_ui_checkbox.isChecked()
+        settings = {}
 
-            for obsolete in ("use_ps_markers", "restore_paragraph_epub", "restore_paragraph_txt"):
-                settings.pop(obsolete, None)
+        settings["use_inline_formatting"] = self.inline_formatting_checkbox.isChecked()
 
-            skip_inline_tags = {}
-            for tag, checkbox in self.skip_inline_checkboxes.items():
-                skip_inline_tags[tag] = checkbox.isChecked()
-            settings["skip_inline_tags"] = skip_inline_tags
+        skip_tags = {}
+        for tag, checkbox in self.inline_tag_checkboxes.items():
+            skip_tags[tag] = checkbox.isChecked()
+        settings["skip_inline_tags"] = skip_tags
 
+        settings["restore_paragraph_structure"] = self.restore_para_checkbox.isChecked()
+
+        para_sub_settings = {}
+        for key, widget in self.para_sub_widgets.items():
+            if hasattr(widget, 'isChecked'):
+                para_sub_settings[key] = widget.isChecked()
+            elif hasattr(widget, 'value'):
+                para_sub_settings[key] = widget.value()
+            elif hasattr(widget, 'currentText'):
+                para_sub_settings[key] = widget.currentText()
+        settings["para_sub_settings"] = para_sub_settings
+
+        if hasattr(self, 'mismatch_check_checkboxes'):
             mismatch_checks = {}
             for check_name, checkbox in self.mismatch_check_checkboxes.items():
                 mismatch_checks[check_name] = checkbox.isChecked()
             settings["mismatch_checks"] = mismatch_checks
 
             settings["mismatch_thresholds"] = {
-                "length_ratio_short":                round(self.length_ratio_short_spinbox.value(), 2),
-                "length_ratio_medium":               round(self.length_ratio_medium_spinbox.value(), 2),
-                "length_ratio_long":                 round(self.length_ratio_long_spinbox.value(), 2),
-                "untranslated_ratio":                round(self.untranslated_ratio_spinbox.value(), 2),
-                "position_shift_threshold":          round(self.position_shift_threshold_spinbox.value(), 2),
-                "inline_position_shift_threshold":   round(self.inline_position_shift_threshold_spinbox.value(), 2),
+                "length_ratio_short":               round(self.length_ratio_short_spinbox.value(), 2),
+                "length_ratio_medium":              round(self.length_ratio_medium_spinbox.value(), 2),
+                "length_ratio_long":                round(self.length_ratio_long_spinbox.value(), 2),
+                "length_ratio_too_short":           round(self.length_ratio_too_short_spinbox.value(), 2),
+                "untranslated_ratio":               round(self.untranslated_ratio_spinbox.value(), 2),
+                "position_shift_threshold":         round(self.position_shift_threshold_spinbox.value(), 2),
+                "inline_position_shift_threshold":  round(self.inline_position_shift_threshold_spinbox.value(), 2),
             }
 
-            model_name_input = self.alignment_model_edit.text().strip()
-            if not model_name_input:
-                model_name_input = "xlm-roberta-large"
-            settings["alignment_settings"] = {
-                "device":     self.alignment_device_combo.currentText(),
-                "model_name": model_name_input,
-            }
-            logger.info(
-                f"Saving settings - use_inline_formatting: {settings['use_inline_formatting']}, "
-                f"restore_paragraph_structure: {settings['restore_paragraph_structure']}, "
-                f"alignment_settings: {settings['alignment_settings']}"
-            )
-            AppSettingsManager.save_settings(settings)
-            self.app_settings = settings
-            self._initialize_components()
-            self._refresh_alignment_status(model_name_input)
-            QMessageBox.information(
-                self, "Settings Saved", "Settings have been saved successfully."
-            )
-        except Exception as e:
-            logging.error(f"Failed to save settings: {e}")
-            QMessageBox.critical(self, "Save Error", f"Failed to save settings: {e}")
+        model_name_input = self.alignment_model_edit.text().strip()
+        if not model_name_input:
+            model_name_input = "xlm-roberta-large"
+        settings["alignment_settings"] = {
+            "device":     self.alignment_device_combo.currentText(),
+            "model_name": model_name_input,
+        }
+        logger.info(
+            f"Saving settings - use_inline_formatting: {settings['use_inline_formatting']}, "
+            f"restore_paragraph_structure: {settings['restore_paragraph_structure']}, "
+            f"alignment_settings: {settings['alignment_settings']}"
+        )
+
+        self.app_settings.update(settings)
+        self._save_settings_to_file(settings)
 
     def _on_download_alignment_model(self) -> None:
         model_name = self.alignment_model_edit.text().strip()
@@ -4912,12 +4924,13 @@ class TranslatorApp(QMainWindow):
             return
         for check_name, cb in self.mismatch_check_checkboxes.items():
             self.mismatch_checker.checks[check_name] = cb.isChecked()
-        self.mismatch_checker.thresholds["length_ratio_short"]                = self.length_ratio_short_spinbox.value()
-        self.mismatch_checker.thresholds["length_ratio_medium"]               = self.length_ratio_medium_spinbox.value()
-        self.mismatch_checker.thresholds["length_ratio_long"]                 = self.length_ratio_long_spinbox.value()
-        self.mismatch_checker.thresholds["untranslated_ratio"]                = self.untranslated_ratio_spinbox.value()
-        self.mismatch_checker.thresholds["position_shift_threshold"]          = self.position_shift_threshold_spinbox.value()
-        self.mismatch_checker.thresholds["inline_position_shift_threshold"]   = self.inline_position_shift_threshold_spinbox.value()
+        self.mismatch_checker.thresholds["length_ratio_short"]               = self.length_ratio_short_spinbox.value()
+        self.mismatch_checker.thresholds["length_ratio_medium"]              = self.length_ratio_medium_spinbox.value()
+        self.mismatch_checker.thresholds["length_ratio_long"]                = self.length_ratio_long_spinbox.value()
+        self.mismatch_checker.thresholds["length_ratio_too_short"]           = self.length_ratio_too_short_spinbox.value()
+        self.mismatch_checker.thresholds["untranslated_ratio"]               = self.untranslated_ratio_spinbox.value()
+        self.mismatch_checker.thresholds["position_shift_threshold"]         = self.position_shift_threshold_spinbox.value()
+        self.mismatch_checker.thresholds["inline_position_shift_threshold"]  = self.inline_position_shift_threshold_spinbox.value()
         if not hasattr(self, 'paragraphs') or not self.paragraphs:
             return
         changed = False
