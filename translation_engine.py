@@ -918,13 +918,13 @@ class AutoFixManager:
         return lines
 
     def _get_first_char_details(self, text: str) -> tuple:
-        clean_text = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<nt_\d{2}/>', '', text)
+        clean_text = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<nt_\d{2}/>|</?ps>', '', text)
         clean_text = clean_text.lstrip()
 
         if not clean_text:
             return None, "empty"
 
-        ALL_QUOTES = r'["\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
+        ALL_QUOTES = r'["\'\\u2018\\u2019\\u201C\\u201D\\u201E\\u201F\\u00AB\\u00BB\\u2039\\u203A\\u201A\\u201B\\u2032\\u2033\\u301D\\u301E\\u301F\\uFF02]'
         text_no_quotes = re.sub(f'^{ALL_QUOTES}+', '', clean_text).lstrip()
 
         if not text_no_quotes:
@@ -946,13 +946,13 @@ class AutoFixManager:
         return first_char, desc
 
     def _get_last_char_details(self, text: str) -> dict:
-        clean_text = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<nt_\d{2}/>', '', text)
+        clean_text = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|<nt_\d{2}/>|</?ps>', '', text)
         clean_text = clean_text.rstrip()
 
         if not clean_text:
             return {'char': None, 'type': 'empty', 'description': 'empty text'}
 
-        ALL_QUOTES = r'["\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
+        ALL_QUOTES = r'["\'\\u2018\\u2019\\u201C\\u201D\\u201E\\u201F\\u00AB\\u00BB\\u2039\\u203A\\u201A\\u201B\\u2032\\u2033\\u301D\\u301E\\u301F\\uFF02]'
         text_no_quotes = re.sub(f'{ALL_QUOTES}+$', '', clean_text).rstrip()
 
         if not text_no_quotes:
