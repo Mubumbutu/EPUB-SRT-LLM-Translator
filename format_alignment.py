@@ -26,10 +26,12 @@ XHTML_NS = 'http://www.w3.org/1999/xhtml'
 MODELS_SUBDIR = 'models'
 
 _RE_APOSTROPHES  = re.compile(r"['\u2019\u2018\u02bc\u0060\u00b4]")
-_RE_PUNCT_STRIP  = re.compile(r'^[.,;:!?"\(\)\[\]]+|[.,;:!?"\(\)\[\]]+$')
+_RE_PUNCT_STRIP  = re.compile(r'^[.,;:!?"\(\)\[\]\-]+|[.,;:!?"\(\)\[\]\-]+$')
 _RE_SENTENCE_END = re.compile(r'[.!?]["\'\)\]]*$')
 _RE_ABBREV       = re.compile(r'^[A-Za-z]{1,3}\.$|^\d+\.$')
 _RE_ELLIPSIS     = re.compile(r'\.\.\.$')
+_RE_CONTENT_WORD = re.compile(r'\w', re.UNICODE)
+_HYPHEN_JOINERS  = frozenset({'-', '\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2015'})
 
 def _sanitize_model_name(model_name: str) -> str:
     return model_name.replace('/', '_').replace('\\', '_')
@@ -170,6 +172,8 @@ class FormatAlignmentEngine:
         self._last_src_len: int = 1
         self._align_layers: List[int] = []
         self._sp_model: bool = False
+        self._full_src_embs = None
+        self._full_tgt_embs = None
 
     def load_model(self) -> None:
         try:
@@ -554,9 +558,14 @@ class FormatAlignmentEngine:
             return ''
 
         try:
+            self._full_src_embs = self._get_word_embeddings(src_words)
+            self._full_tgt_embs = self._get_word_embeddings(tgt_words)
+
             alignments = self._compute_alignments_by_sentences(src_words, tgt_words)
         except Exception as exc:
             logger.warning(f"[FormatAlignment] Błąd wyrównania: {exc}")
+            self._full_src_embs = None
+            self._full_tgt_embs = None
             return ''
 
         if not alignments:
@@ -566,7 +575,9 @@ class FormatAlignmentEngine:
         for (s, t) in alignments:
             src_to_tgt.setdefault(s, []).append(t)
 
-        tgt_spans = self._transfer_spans(inline_spans, src_to_tgt, len(tgt_words))
+        tgt_spans = self._transfer_spans(inline_spans, src_to_tgt, len(tgt_words), tgt_words, src_words)
+        self._full_src_embs = None
+        self._full_tgt_embs = None
         if not tgt_spans:
             return ''
 
@@ -627,7 +638,7 @@ class FormatAlignmentEngine:
 
         if element.text:
             for word in element.text.split():
-                if word:
+                if word and _RE_CONTENT_WORD.search(word):
                     output.append((word, current_tags))
 
         for child in element:
@@ -638,7 +649,7 @@ class FormatAlignmentEngine:
             if child_tag.lower() in RESERVE_TAGS:
                 if child.tail:
                     for word in child.tail.split():
-                        if word:
+                        if word and _RE_CONTENT_WORD.search(word):
                             output.append((word, list(parent_tags)))
                 continue
 
@@ -656,19 +667,21 @@ class FormatAlignmentEngine:
                     merged_word = child_text + tail_words[0]
                     output.append((merged_word, span_tags))
                     for word in tail_words[1:]:
-                        output.append((word, list(parent_tags)))
+                        if _RE_CONTENT_WORD.search(word):
+                            output.append((word, list(parent_tags)))
                 elif child_text:
                     output.append((child_text, span_tags))
                 else:
                     for word in tail_words:
-                        output.append((word, list(parent_tags)))
+                        if _RE_CONTENT_WORD.search(word):
+                            output.append((word, list(parent_tags)))
                 continue
 
             self._walk_collect_words(child, current_tags, output)
 
             if child.tail:
                 for word in child.tail.split():
-                    if word:
+                    if word and _RE_CONTENT_WORD.search(word):
                         output.append((word, list(parent_tags)))
 
     def _transfer_spans(
@@ -676,9 +689,39 @@ class FormatAlignmentEngine:
         spans: List[Dict],
         src_to_tgt: Dict[int, List[int]],
         tgt_len: int,
+        tgt_words: List[str],
+        src_words: List[str],
     ) -> List[Dict]:
         src_len = max(1, self._last_src_len)
         result = []
+
+        is_content: List[bool] = [
+            bool(_RE_CONTENT_WORD.search(w)) for w in tgt_words
+        ]
+
+        def _nearest_content(idx: int) -> int:
+            if is_content[idx]:
+                return idx
+            for offset in range(1, tgt_len):
+                for candidate in (idx + offset, idx - offset):
+                    if 0 <= candidate < tgt_len and is_content[candidate]:
+                        return candidate
+            return idx
+
+        def _trim_punct_boundaries(ts: int, te: int) -> Optional[Tuple[int, int]]:
+            while ts <= te and not is_content[ts]:
+                ts += 1
+            while te >= ts and not is_content[te]:
+                te -= 1
+            if ts > te:
+                return None
+            return ts, te
+
+        def _norm_w(w: str) -> str:
+            w = w.lower()
+            w = _RE_APOSTROPHES.sub('', w)
+            w = _RE_PUNCT_STRIP.sub('', w)
+            return w
 
         for span in spans:
             if 'first-letter' in span.get('attrs', {}).get('class', '').split():
@@ -714,6 +757,55 @@ class FormatAlignmentEngine:
             for s in range(ws, we + 1):
                 tgt_indices.extend(src_to_tgt.get(s, []))
 
+            span_len = we - ws + 1
+            _neural_span_n = (max(tgt_indices) - min(tgt_indices) + 1) if tgt_indices else 0
+            _neural_is_contiguous_multi = (
+                len(tgt_indices) > 1
+                and _neural_span_n == len(tgt_indices)
+                and _neural_span_n >= span_len
+            )
+            if (span_len <= 3
+                    and not _neural_is_contiguous_multi
+                    and self._full_src_embs is not None
+                    and self._full_tgt_embs is not None):
+                try:
+                    span_src_emb = self._full_src_embs[ws: we + 1].mean(dim=0, keepdim=True)
+                    span_src_norm = F.normalize(span_src_emb, p=2, dim=-1)
+                    tgt_norm_emb  = F.normalize(self._full_tgt_embs, p=2, dim=-1)
+                    direct_sim    = torch.mv(tgt_norm_emb, span_src_norm.squeeze())
+
+                    for t_idx, ok in enumerate(is_content):
+                        if not ok:
+                            direct_sim[t_idx] = float('-inf')
+
+                    direct_best_t = int(direct_sim.argmax().item())
+                    direct_best_v = direct_sim[direct_best_t].item()
+
+                    neural_best_t = tgt_indices[0] if len(tgt_indices) == 1 else (
+                        min(tgt_indices) if tgt_indices else None
+                    )
+                    neural_best_v = (
+                        direct_sim[neural_best_t].item()
+                        if neural_best_t is not None else -1.0
+                    )
+
+                    SIM_ACCEPT = 0.20
+                    MARGIN     = 0.02
+
+                    if (direct_best_v >= SIM_ACCEPT
+                            and direct_best_v >= neural_best_v + MARGIN):
+                        logger.debug(
+                            f"[FormatAlignment] Span '{span['tag']}' [{ws}-{we}]: "
+                            f"direct sim override → tgt[{direct_best_t}] "
+                            f"(sim={direct_best_v:.3f} vs neural={neural_best_v:.3f})"
+                        )
+                        tgt_indices = [direct_best_t]
+                except Exception as exc:
+                    logger.debug(
+                        f"[FormatAlignment] Direct-sim lookup failed for span "
+                        f"'{span['tag']}': {exc}"
+                    )
+
             if not tgt_indices:
                 src_total = max(1, src_len - 1)
                 ratio_start = ws / src_total
@@ -728,20 +820,94 @@ class FormatAlignmentEngine:
             t_start = max(0,         min(tgt_indices))
             t_end   = min(tgt_len-1, max(tgt_indices))
 
-            tgt_coverage = (t_end - t_start + 1) / tgt_len
-            if src_coverage > 0.5 and tgt_coverage < 0.2 and tgt_len > 2:
-                expected_tgt_len = max(1, round(src_coverage * tgt_len))
-                current_tgt_len  = t_end - t_start + 1
-                if expected_tgt_len > current_tgt_len:
-                    extra = expected_tgt_len - current_tgt_len
-                    half  = extra // 2
-                    t_start = max(0,         t_start - half)
-                    t_end   = min(tgt_len-1, t_start + expected_tgt_len - 1)
+            src_total = max(1, src_len - 1)
+            prop_t_start = _nearest_content(
+                min(tgt_len - 1, int(ws / src_total * (tgt_len - 1)))
+            )
+            prop_t_end   = _nearest_content(
+                min(tgt_len - 1, round(we / src_total * (tgt_len - 1)))
+            )
+
+            span_words = we - ws + 1
+            drift_pct  = 0.20 if span_words <= 2 else 0.35
+            drift_limit = max(1, int(drift_pct * tgt_len))
+            if abs(t_start - prop_t_start) >= drift_limit:
+                logger.debug(
+                    f"[FormatAlignment] Span '{span['tag']}': neural drift too large "
+                    f"(neural=[{t_start},{t_end}] vs prop=[{prop_t_start},{prop_t_end}], "
+                    f"limit={drift_limit}, pct={drift_pct}) → falling back to proportional"
+                )
+                t_start = prop_t_start
+                t_end   = prop_t_end
+
+            _src_span_norms = {
+                _norm_w(src_words[i])
+                for i in range(ws, min(we + 1, len(src_words)))
+                if len(_norm_w(src_words[i])) >= 2
+            }
+            _tgt_cur_norms = {
+                _norm_w(tgt_words[i])
+                for i in range(t_start, t_end + 1)
+                if len(_norm_w(tgt_words[i])) >= 2
+            }
+            _has_exact_anchor = bool(_src_span_norms & _tgt_cur_norms)
+
+            if t_start > prop_t_start and not _has_exact_anchor:
+                slide  = t_start - prop_t_start
+                new_ts = max(0, t_start - slide)
+                new_te = min(tgt_len - 1, t_end - slide)
+                if new_te >= new_ts:
                     logger.debug(
-                        f"[FormatAlignment] Span '{span['tag']}': proporcjonalne "
-                        f"rozszerzenie tgt → [{t_start}..{t_end}] "
-                        f"(src_cov={src_coverage:.2f}, tgt_cov_przed={tgt_coverage:.2f})"
+                        f"[FormatAlignment] Span '{span['tag']}' [{ws}-{we}]: "
+                        f"right-drift slide {slide} → [{new_ts},{new_te}] "
+                        f"(was [{t_start},{t_end}], prop_t_start={prop_t_start})"
                     )
+                    t_start, t_end = new_ts, new_te
+
+            span_src_words_n = we - ws + 1
+            expected_tgt_span_n = max(1, round(span_src_words_n * tgt_len / max(1, src_len)))
+            current_tgt_span_n  = t_end - t_start + 1
+            if current_tgt_span_n < expected_tgt_span_n:
+                extra  = expected_tgt_span_n - current_tgt_span_n
+                half_l = (extra + 1) // 2
+
+                new_ts = max(t_start - half_l, prop_t_start)
+
+                new_te = min(tgt_len - 1, new_ts + expected_tgt_span_n - 1)
+
+                if new_ts > prop_t_start:
+                    shift  = new_ts - prop_t_start
+                    new_ts = prop_t_start
+                    new_te = max(new_ts, new_te - shift)
+                logger.debug(
+                    f"[FormatAlignment] Span '{span['tag']}' [{ws}-{we}]: "
+                    f"expansion [{t_start},{t_end}] → [{new_ts},{new_te}] "
+                    f"(exp={expected_tgt_span_n}, was={current_tgt_span_n}, "
+                    f"prop_t_start={prop_t_start})"
+                )
+                t_start, t_end = new_ts, new_te
+
+            if span_src_words_n >= 3 and t_end > prop_t_end:
+                clipped = t_end - prop_t_end
+                t_end   = prop_t_end
+                t_start = max(0, t_start - clipped)
+                logger.debug(
+                    f"[FormatAlignment] Span '{span['tag']}' [{ws}-{we}]: "
+                    f"t_end ceiling → [{t_start},{t_end}] (clipped={clipped})"
+                )
+                if t_start > t_end:
+                    t_start = t_end
+
+            tgt_coverage = (t_end - t_start + 1) / tgt_len
+
+            trimmed = _trim_punct_boundaries(t_start, t_end)
+            if trimmed is None:
+                logger.debug(
+                    f"[FormatAlignment] Span '{span['tag']}' [{ws}-{we}]: "
+                    f"entire tgt span [{t_start},{t_end}] is pure-punct → skipping"
+                )
+                continue
+            t_start, t_end = trimmed
 
             result.append({
                 'tag':        span['tag'],
@@ -840,6 +1006,25 @@ class FormatAlignmentEngine:
 
         return sorted(pairs)
 
+    def _itermax_bidirectional(
+        self,
+        sim,
+        S: int,
+        T: int,
+    ) -> List[Tuple[int, int]]:
+        fwd_pairs = set(self._itermax(sim, S, T))
+        bwd_raw   = self._itermax(sim.t().contiguous(), T, S)
+        bwd_pairs = {(s, t) for (t, s) in bwd_raw}
+
+        intersection = fwd_pairs & bwd_pairs
+
+        covered_src = {s for (s, _) in intersection}
+        for (s, t) in fwd_pairs:
+            if s not in covered_src:
+                intersection.add((s, t))
+
+        return sorted(intersection)
+
     def _compute_alignments(
         self,
         src_words: List[str],
@@ -893,13 +1078,20 @@ class FormatAlignmentEngine:
             tgt_norm_emb = F.normalize(tgt_embs, p=2, dim=-1)
             sim = torch.mm(src_norm_emb, tgt_norm_emb.t())
 
+            for t_idx, tw in enumerate(tgt_words):
+                if not _RE_CONTENT_WORD.search(tw):
+                    sim[:, t_idx] = -2.0
+                    logger.debug(
+                        f"[FormatAlignment] Masking pure-punct tgt[{t_idx}]='{tw}'"
+                    )
+
             if forced_s2t:
                 forced_s_list = list(forced_s2t.keys())
                 forced_t_list = list(forced_s2t.values())
                 sim[forced_s_list, :] = -2.0
                 sim[:, forced_t_list] = -2.0
 
-            neural_pairs = self._itermax(sim, S, T)
+            neural_pairs = self._itermax_bidirectional(sim, S, T)
 
         else:
             logger.warning("[FormatAlignment] Brak embeddingów – używam fallback proporcjonalny")
@@ -993,17 +1185,26 @@ class FormatAlignmentEngine:
         if self._sp_model:
             word_idx = -1
             first_content_seen = False
+            prev_bare_tok: Optional[str] = None
 
             for tok_pos, tok in enumerate(tokens):
                 if tok in special_tokens:
                     continue
 
-                if tok.startswith('\u2581') or not first_content_seen:
+                bare_tok = tok.lstrip('\u2581')
+                starts_new_word = tok.startswith('\u2581') or not first_content_seen
+
+                if starts_new_word and prev_bare_tok in _HYPHEN_JOINERS:
+                    starts_new_word = False
+
+                if starts_new_word:
                     word_idx += 1
                     first_content_seen = True
 
                 if 0 <= word_idx < len(words):
                     word_ids[tok_pos] = word_idx
+
+                prev_bare_tok = bare_tok
 
         else:
             word_idx = -1
