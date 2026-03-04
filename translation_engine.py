@@ -782,9 +782,9 @@ class AutoFixManager:
 
         if flag_key == 'reserve_elements':
             if isinstance(flag_value, dict):
-                missing   = flag_value.get('missing', [])
-                extra     = flag_value.get('extra', [])
-                spurious  = flag_value.get('spurious_closing', [])
+                missing    = flag_value.get('missing', [])
+                extra      = flag_value.get('extra', [])
+                spurious   = flag_value.get('spurious_closing', [])
                 pos_errors = flag_value.get('positioning', [])
 
                 if missing:
@@ -803,8 +803,8 @@ class AutoFixManager:
                     lines.append("")
                     lines.append(f"  ❌ PLACEHOLDER POSITION ERRORS:")
                     for error in pos_errors[:4]:
-                        tag_id = error.get('tag_id', '??')
-                        orig_pct = int(error.get('orig_rel_pos', 0) * 100)
+                        tag_id    = error.get('tag_id', '??')
+                        orig_pct  = int(error.get('orig_rel_pos', 0) * 100)
                         trans_pct = int(error.get('trans_rel_pos', 0) * 100)
                         lines.append(f"     • <id_{tag_id}> should be ~{orig_pct}% but is at ~{trans_pct}%")
 
@@ -820,7 +820,6 @@ class AutoFixManager:
             lines.append("  ❌ Inline formatting tags (<p_xx>) are broken or mismatched")
 
             if isinstance(flag_value, dict) and flag_value:
-                # Opening tags
                 if 'opening_tags' in flag_value:
                     ot = flag_value['opening_tags']
                     if ot.get('missing'):
@@ -828,7 +827,6 @@ class AutoFixManager:
                     if ot.get('extra'):
                         lines.append(f"     ❌ Extra opening: {', '.join(ot['extra'][:6])}")
 
-                # Closing tags
                 if 'closing_tags' in flag_value:
                     ct = flag_value['closing_tags']
                     if ct.get('missing'):
@@ -849,12 +847,11 @@ class AutoFixManager:
             else:
                 lines.append("     (no detailed info – probably missing/extra <p_XX> tags)")
 
-            # Specjalna rada dla tytułów rozdziałów (bardzo częsty przypadek błędu)
             if len(original.strip()) < 80 and '<p_' not in original:
                 lines.append("     💡 This looks like a chapter title — LLM often adds phantom <p_xx> tags here.")
 
         elif flag_key == 'ps_markers':
-            ps_in_orig = original.count('<ps>')
+            ps_in_orig  = original.count('<ps>')
             ps_in_trans = translation.count('<ps>')
             lines.append(f"  ❌ Paragraph structure mismatch")
             lines.append(f"     Original: {ps_in_orig} <ps> markers")
@@ -866,15 +863,22 @@ class AutoFixManager:
 
         elif flag_key == 'length':
             if isinstance(flag_value, dict):
-                orig_len = flag_value.get("orig_chars", 0)
+                orig_len  = flag_value.get("orig_chars", 0)
                 trans_len = flag_value.get("trans_chars", 0)
-                ratio = flag_value.get("ratio", 1.0)
+                ratio     = flag_value.get("ratio", 1.0)
                 lines.append(f"  ❌ Significant length difference:")
-                lines.append(f"     Original: {orig_len} characters")
+                lines.append(f"     Original:    {orig_len} characters")
                 lines.append(f"     Translation: {trans_len} characters")
                 lines.append(f"     Ratio: {ratio:.2f}x")
-                if ratio > 1.7 and orig_len < 80:
+                if ratio < 1.0:
+                    lines.append(f"  → Translation is TOO SHORT — it likely skipped part of the text")
+                    lines.append(f"     Make sure the ENTIRE original is translated, not just part of it")
+                    if orig_len < 80:
+                        lines.append(f"     💡 This looks like a chapter title — translate the full title including numbers/subtitles")
+                elif ratio > 1.7 and orig_len < 80:
                     lines.append("     → This looks like a chapter title — keep it short!")
+                else:
+                    lines.append("     → Translation is TOO LONG — avoid adding explanations or extra content")
 
         elif flag_key == 'content_drift':
             lines.append("  ❌ CONTENT DRIFT detected")
