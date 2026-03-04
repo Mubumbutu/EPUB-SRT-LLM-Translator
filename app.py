@@ -4566,36 +4566,30 @@ class TranslatorApp(QMainWindow):
             )
 
     def save_app_settings(self):
-        if not hasattr(self, 'inline_formatting_checkbox'):
-            return
-
-        settings = {}
-
-        settings["use_inline_formatting"] = self.inline_formatting_checkbox.isChecked()
-
-        skip_tags = {}
-        for tag, checkbox in self.inline_tag_checkboxes.items():
-            skip_tags[tag] = checkbox.isChecked()
-        settings["skip_inline_tags"] = skip_tags
-
-        settings["restore_paragraph_structure"] = self.restore_para_checkbox.isChecked()
-
-        para_sub_settings = {}
-        for key, widget in self.para_sub_widgets.items():
-            if hasattr(widget, 'isChecked'):
-                para_sub_settings[key] = widget.isChecked()
-            elif hasattr(widget, 'value'):
-                para_sub_settings[key] = widget.value()
-            elif hasattr(widget, 'currentText'):
-                para_sub_settings[key] = widget.currentText()
-        settings["para_sub_settings"] = para_sub_settings
-
-        if hasattr(self, 'mismatch_check_checkboxes'):
+        try:
+            settings = self.app_settings.copy()
+            settings["llm_choice"] = self.llm_choice_combo.currentText()
+            settings["server_url"] = self.server_url_edit.text().strip()
+            if settings["llm_choice"] == "Ollama":
+                settings["ollama_model_name"] = self.ollama_model_edit.text()
+            elif settings["llm_choice"] == "Openrouter":
+                settings["openrouter_api_key"] = self.openrouter_api_key_edit.text()
+                settings["openrouter_model_name"] = self.openrouter_model_edit.text()
+            settings["deepl_free_api_key"] = self.deepl_free_api_key_edit.text()
+            settings["deepl_pro_api_key"] = self.deepl_pro_api_key_edit.text()
+            settings["use_inline_formatting"] = self.inline_formatting_checkbox.isChecked()
+            settings["restore_paragraph_structure"] = self.restore_paragraph_checkbox.isChecked()
+            settings["show_ps_in_ui"] = self.show_ps_in_ui_checkbox.isChecked()
+            for obsolete in ("use_ps_markers", "restore_paragraph_epub", "restore_paragraph_txt"):
+                settings.pop(obsolete, None)
+            skip_inline_tags = {}
+            for tag, checkbox in self.skip_inline_checkboxes.items():
+                skip_inline_tags[tag] = checkbox.isChecked()
+            settings["skip_inline_tags"] = skip_inline_tags
             mismatch_checks = {}
             for check_name, checkbox in self.mismatch_check_checkboxes.items():
                 mismatch_checks[check_name] = checkbox.isChecked()
             settings["mismatch_checks"] = mismatch_checks
-
             settings["mismatch_thresholds"] = {
                 "length_ratio_short":               round(self.length_ratio_short_spinbox.value(), 2),
                 "length_ratio_medium":              round(self.length_ratio_medium_spinbox.value(), 2),
@@ -4605,22 +4599,28 @@ class TranslatorApp(QMainWindow):
                 "position_shift_threshold":         round(self.position_shift_threshold_spinbox.value(), 2),
                 "inline_position_shift_threshold":  round(self.inline_position_shift_threshold_spinbox.value(), 2),
             }
-
-        model_name_input = self.alignment_model_edit.text().strip()
-        if not model_name_input:
-            model_name_input = "xlm-roberta-large"
-        settings["alignment_settings"] = {
-            "device":     self.alignment_device_combo.currentText(),
-            "model_name": model_name_input,
-        }
-        logger.info(
-            f"Saving settings - use_inline_formatting: {settings['use_inline_formatting']}, "
-            f"restore_paragraph_structure: {settings['restore_paragraph_structure']}, "
-            f"alignment_settings: {settings['alignment_settings']}"
-        )
-
-        self.app_settings.update(settings)
-        self._save_settings_to_file(settings)
+            model_name_input = self.alignment_model_edit.text().strip()
+            if not model_name_input:
+                model_name_input = "xlm-roberta-large"
+            settings["alignment_settings"] = {
+                "device":     self.alignment_device_combo.currentText(),
+                "model_name": model_name_input,
+            }
+            logger.info(
+                f"Saving settings - use_inline_formatting: {settings['use_inline_formatting']}, "
+                f"restore_paragraph_structure: {settings['restore_paragraph_structure']}, "
+                f"alignment_settings: {settings['alignment_settings']}"
+            )
+            AppSettingsManager.save_settings(settings)
+            self.app_settings = settings
+            self._initialize_components()
+            self._refresh_alignment_status(model_name_input)
+            QMessageBox.information(
+                self, "Settings Saved", "Settings have been saved successfully."
+            )
+        except Exception as e:
+            logging.error(f"Failed to save settings: {e}")
+            QMessageBox.critical(self, "Save Error", f"Failed to save settings: {e}")
 
     def _on_download_alignment_model(self) -> None:
         model_name = self.alignment_model_edit.text().strip()
