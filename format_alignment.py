@@ -1,4 +1,5 @@
 # format_alignment.py
+
 from __future__ import annotations
 import gc
 import logging
@@ -1012,6 +1013,7 @@ class FormatAlignmentEngine:
         S: int,
         T: int,
     ) -> List[Tuple[int, int]]:
+
         fwd_pairs = set(self._itermax(sim, S, T))
         bwd_raw   = self._itermax(sim.t().contiguous(), T, S)
         bwd_pairs = {(s, t) for (t, s) in bwd_raw}
