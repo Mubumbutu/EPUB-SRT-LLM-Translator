@@ -5207,8 +5207,6 @@ class TranslatorApp(QMainWindow):
 
     def _update_context_visibility(self):
         batch_on = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
-        json_on = hasattr(self, 'json_payload_checkbox') and self.json_payload_checkbox.isChecked()
-        hide = batch_on or json_on
         for widget in [
             getattr(self, '_lbl_context_before', None),
             getattr(self, 'context_before_spinbox', None),
@@ -5216,7 +5214,7 @@ class TranslatorApp(QMainWindow):
             getattr(self, 'context_after_spinbox', None),
         ]:
             if widget is not None:
-                widget.setVisible(not hide)
+                widget.setVisible(not batch_on)
 
     def _show_ps_in_ui(self) -> bool:
         if not hasattr(self, 'inline_formatting_checkbox'):
