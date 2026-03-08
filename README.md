@@ -2,7 +2,7 @@
 
 A desktop application for translating **EPUB**, **SRT**, and **TXT** files using local or cloud-hosted language models.
 
-<img width="1504" height="990" alt="trann" src="https://github.com/user-attachments/assets/8d878fd9-e295-4e31-94c8-669cf7d4d05b" />
+<img width="1502" height="850" alt="tar" src="https://github.com/user-attachments/assets/e367cca8-55c1-4fa4-ae2d-05d3ab494323" />
 
 ---
 
