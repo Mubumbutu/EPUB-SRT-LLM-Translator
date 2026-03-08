@@ -19,6 +19,8 @@ from deep_translator import GoogleTranslator
 from epub_creator_lxml import EPUBCreatorLxml
 from file_processors import FileProcessorFactory
 from format_alignment import (
+    FormatAlignmentEngine,
+    INLINE_TRANSFER_TAGS,
     download_model as _download_alignment_model_fn,
     download_model as _fa_download_model,
     get_local_model_path,
@@ -32,12 +34,16 @@ from formatting import (
     MismatchChecker,
     SINGLE_QUOTES_CHARS,
 )
-from PyQt6.QtCore import pyqtSignal, Qt, QThread, QTimer
-from PyQt6.QtGui import QColor, QIcon, QPalette
+from epub_preview import EPUBPreviewEngine, EPUBPreviewToolbar, EPUBReaderWindow
+from PyQt6.QtCore import pyqtSignal, Qt, QThread, QTimer, QUrl
+from PyQt6.QtGui import QColor, QCursor, QIcon, QPalette
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineCore import QWebEnginePage
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -49,7 +55,9 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -62,11 +70,14 @@ from PyQt6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QGridLayout,
 )
 from translation_engine import (
     AutoFixManager,
+    BatchSplitError,
     LLMClientFactory,
     PromptBuilder,
+    SentenceBatcher,
     TranslationOrchestrator,
 )
 from typing import Dict, List, Optional
@@ -117,7 +128,8 @@ class TranslationWorkerThread(QThread):
             self.orchestrator.hard_cancel()
         if self.isRunning():
             self.terminate()
-            logging.info("TranslationWorkerThread: wątek terminowany (hard cancel)")
+            self.wait(2000)
+            logging.info("TranslationWorkerThread: thread terminated (hard cancel)")
 
     def _on_retry_attempt(self, attempt: int, max_attempts: int, temperature: float):
         idx = self.fragment.get('index', 0)
@@ -145,6 +157,177 @@ class TranslationWorkerThread(QThread):
             logging.error(traceback.format_exc())
             self.progress.emit(idx, error_msg, True)
 
+        finally:
+            self.finished.emit()
+
+
+class TranslationBatchWorkerThread(QThread):
+    batch_progress = pyqtSignal(list, list, bool)
+    retry_progress = pyqtSignal(int, int, float)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        orchestrator,
+        fragments,
+        indices,
+        context_before,
+        context_after,
+        temperature,
+        auto_fix_manager=None,
+        mismatch_checker=None,
+        batcher=None,
+        batch_hint_template=""
+    ):
+        super().__init__()
+        self.orchestrator = orchestrator
+        self.fragments = fragments
+        self.indices = indices
+        self.context_before = context_before
+        self.context_after = context_after
+        self.temperature = temperature
+        self.auto_fix_manager = auto_fix_manager
+        self.mismatch_checker = mismatch_checker
+        self.batcher = batcher
+        self.batch_hint_template = batch_hint_template
+        self._cancelled = False
+
+    def request_cancel(self):
+        self._cancelled = True
+        if self.orchestrator:
+            self.orchestrator.cancel()
+
+    def hard_cancel(self):
+        self._cancelled = True
+        if self.orchestrator:
+            self.orchestrator.hard_cancel()
+        if self.isRunning():
+            self.terminate()
+            self.wait(2000)
+
+    def run(self):
+        try:
+            batch_text, offsets = self.batcher.prepare_batch(self.fragments)
+            n = len(self.fragments)
+            max_attempts = self.auto_fix_manager.max_attempts if self.auto_fix_manager else 3
+            last_error = None
+            last_response = ""
+
+            for attempt in range(1, max_attempts + 1):
+                if self._cancelled:
+                    return
+
+                try:
+                    batch_hint = self.batcher.build_batch_hint(n, self.batch_hint_template)
+
+                    if attempt > 1 and last_error is not None:
+                        actual = SentenceBatcher.count_sentence_markers(last_response)
+                        extra = (
+                            f"\n\nPREVIOUS ATTEMPT FAILED: found {actual} <z> marker(s) instead of {n - 1}.\n"
+                            f"You MUST output EXACTLY {n - 1} <z> marker(s). Count them carefully before responding."
+                        )
+                        batch_hint = batch_hint + extra
+
+                    self.orchestrator.prompt_builder._pending_batch_hint = batch_hint
+
+                    prompt = self.orchestrator.prompt_builder.build_prompt(
+                        core_text=batch_text,
+                        context_before="",
+                        context_after=""
+                    )
+
+                    response = self.orchestrator.llm_client.translate(
+                        prompt,
+                        self.temperature,
+                        self.orchestrator.timeout_seconds
+                    )
+
+                    if self._cancelled:
+                        return
+
+                    last_response = response.strip()
+
+                    outer_match = re.match(
+                        r'^<(?:translated|translation)>(.*)</(?:translated|translation)>$',
+                        last_response,
+                        re.DOTALL | re.IGNORECASE
+                    )
+                    if outer_match:
+                        last_response = outer_match.group(1).strip()
+
+                    translations = self.batcher.split_response(last_response, n, offsets)
+                    self.batch_progress.emit(self.indices, translations, False)
+                    return
+
+                except BatchSplitError as e:
+                    if self._cancelled:
+                        return
+                    last_error = e
+                    logging.warning(f"Batch attempt {attempt}/{max_attempts} failed: {e}")
+                    if attempt == max_attempts:
+                        raise
+
+            raise last_error
+
+        except Exception as e:
+            if self._cancelled:
+                return
+            error_msg = f"Batch translation failed: {e}"
+            logging.error(error_msg)
+            self.batch_progress.emit(self.indices, [error_msg] * len(self.indices), True)
+
+        finally:
+            self.finished.emit()
+
+
+class AlignmentWorkerThread(QThread):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal()
+
+    def __init__(self, paragraphs, model_name, device, models_dir):
+        super().__init__()
+        self.paragraphs = paragraphs
+        self.model_name = model_name
+        self.device = device
+        self.models_dir = models_dir
+        self._cancelled = False
+
+    def request_cancel(self):
+        self._cancelled = True
+
+    def hard_cancel(self):
+        self._cancelled = True
+        if self.isRunning():
+            self.terminate()
+            logging.info("AlignmentWorkerThread: terminated (hard cancel)")
+
+    def run(self):
+        try:
+            engine = FormatAlignmentEngine(
+                model_name=self.model_name,
+                device=self.device,
+                local_models_dir=self.models_dir,
+            )
+            engine.load_model()
+
+            total = len(self.paragraphs)
+            completed = 0
+
+            for para in self.paragraphs:
+                if self._cancelled:
+                    break
+                engine.align_batch([para])
+                completed += 1
+                self.progress.emit(completed, total)
+
+            try:
+                engine.unload_model()
+            except Exception as exc:
+                logging.warning(f"AlignmentWorkerThread: unload_model error: {exc}")
+
+        except Exception as e:
+            logging.error(f"AlignmentWorkerThread error: {e}")
+            logging.error(traceback.format_exc())
         finally:
             self.finished.emit()
 
@@ -225,6 +408,194 @@ class TXTCreator(QThread):
         except Exception as e:
             self.finished.emit(str(e), True)
 
+class AlignmentSaveDialog(QDialog):
+    """
+    Dialog shown before saving a Legacy-mode EPUB that has aligned fragments.
+    Lets the user choose which alignment quality levels (dot colours) to
+    include in the saved file.  Fragments whose dot is not selected are saved
+    with plain translated text instead of the aligned HTML.
+    """
+
+    _DOT_DEFS = [
+        ('🟢', 'Green',  'Auto-wrap / manually confirmed',  True),
+        ('🟡', 'Yellow', 'Neural model — probably OK',      True),
+        ('🟠', 'Orange', 'Neural model — worth checking',   False),
+    ]
+
+    def __init__(self, counts, parent=None):
+        """
+        Parameters
+        ----------
+        counts : dict  {emoji: int}  number of aligned paragraphs per dot
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Save EPUB — Alignment Filter")
+        self.setMinimumWidth(460)
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e1e; color: #cccccc; }
+            QLabel  { color: #cccccc; }
+            QCheckBox { color: #cccccc; font-size: 12px; spacing: 8px; }
+            QCheckBox::indicator {
+                width: 15px; height: 15px;
+                border-radius: 3px; border: 2px solid #555;
+                background-color: #1e1e1e;
+            }
+            QCheckBox::indicator:checked {
+                border-color: #2a6aaa; background-color: #1a4a7a;
+            }
+            QPushButton {
+                padding: 6px 18px; border-radius: 4px; font-size: 12px;
+                background-color: #2a2a2a; color: #ccc;
+                border: 1px solid #444;
+            }
+            QPushButton:hover { background-color: #3a3a3a; color: white; }
+            QPushButton#save_btn {
+                background-color: #1e5fa8; color: white;
+                border: 1px solid #2a6aaa; font-weight: bold;
+            }
+            QPushButton#save_btn:hover { background-color: #2a72c8; }
+            QFrame#sep { background-color: #333; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(18, 14, 18, 14)
+
+        intro = QLabel(
+            "This EPUB uses <b>Legacy mode</b> with alignment data.<br>"
+            "Choose which alignment quality levels to include in the saved file.<br>"
+            "<span style='color:#888;font-size:11px;'>"
+            "Excluded fragments will be saved with plain translated text.</span>"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        sep1 = QFrame()
+        sep1.setObjectName('sep')
+        sep1.setFrameShape(QFrame.Shape.HLine)
+        sep1.setFixedHeight(1)
+        layout.addWidget(sep1)
+
+        self._checkboxes = {}
+
+        for emoji, short, desc, default in self._DOT_DEFS:
+            n = counts.get(emoji, 0)
+            if n == 0:
+                continue
+            cb = QCheckBox(f"{emoji}  {short} — {desc}   ({n} fragment{'s' if n != 1 else ''})")
+            cb.setChecked(default)
+            layout.addWidget(cb)
+            self._checkboxes[emoji] = cb
+
+        info_rows = []
+        n_red   = counts.get('🔴', 0)
+        n_black = counts.get('⚫', 0)
+        n_none  = counts.get('○',  0)
+        if n_red:
+            info_rows.append(
+                f"🔴  Flagged as bad — <b>always excluded</b> ({n_red} fragment{'s' if n_red != 1 else ''})"
+            )
+        if n_black:
+            info_rows.append(
+                f"⚫  No inline tags — not applicable ({n_black} fragment{'s' if n_black != 1 else ''})"
+            )
+        if n_none:
+            info_rows.append(
+                f"○  Not yet aligned — will save plain text ({n_none} fragment{'s' if n_none != 1 else ''})"
+            )
+
+        if info_rows:
+            sep2 = QFrame()
+            sep2.setObjectName('sep')
+            sep2.setFrameShape(QFrame.Shape.HLine)
+            sep2.setFixedHeight(1)
+            layout.addWidget(sep2)
+            for row in info_rows:
+                lbl = QLabel(row)
+                lbl.setStyleSheet("color: #666; font-size: 11px;")
+                layout.addWidget(lbl)
+
+        layout.addSpacing(4)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_save = QPushButton("Save EPUB")
+        btn_save.setObjectName("save_btn")
+        btn_save.setDefault(True)
+        btn_save.clicked.connect(self.accept)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
+
+    def selected_dots(self):
+        """Return set of dot emojis the user wants to INCLUDE."""
+        return {emoji for emoji, cb in self._checkboxes.items() if cb.isChecked()}
+
+
+class EPUBPreviewPage(QWebEnginePage):
+    """
+    Custom QWebEnginePage that intercepts epub-preview://select/<element_id>
+    navigation requests triggered by JS click handlers in the preview.
+    Emits fragment_selected(str) with the element id.
+    Also intercepts epub-preview://contextmenu/<element_id> and emits
+    contextmenu_requested(str) so Python can show a native context menu.
+    """
+    fragment_selected    = pyqtSignal(str)
+    contextmenu_requested = pyqtSignal(str)
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+        from PyQt6.QtCore import QUrl
+        if isinstance(url, QUrl):
+            scheme = url.scheme()
+            host   = url.host()
+            path   = url.path().lstrip('/')
+        else:
+            return True
+        if scheme == 'epub-preview' and host == 'select':
+            elem_id = path
+            if elem_id:
+                self.fragment_selected.emit(elem_id)
+            return False
+        if scheme == 'epub-preview' and host == 'contextmenu':
+            elem_id = path
+            if elem_id:
+                self.contextmenu_requested.emit(elem_id)
+            return False
+        return True
+
+
+def _html_strip_outer_tag(html: str) -> str:
+    """Return the inner content of an HTML element, stripping the outermost tag.
+
+    E.g.  '<p xmlns="..." id="x">foo <b>bar</b></p>'  →  'foo <b>bar</b>'
+    If the outer tag cannot be detected the original string is returned unchanged.
+    """
+    html = html.strip()
+    m = re.match(r'^<[^>]+>(.*)</\w+>\s*$', html, re.DOTALL)
+    if m:
+        return m.group(1)
+    return html
+
+
+def _html_restore_outer_tag(inner: str, original_html: str) -> str:
+    """Re-wrap *inner* with the opening/closing tag taken from *original_html*.
+
+    This is the inverse of _html_strip_outer_tag and is used when saving
+    user edits back to the paragraph dict — the stored value must always be
+    a full element (outer tag included) so that the EPUB writer can use it
+    directly.
+    """
+    original_html = original_html.strip()
+    m_open = re.match(r'^(<(\w+)[^>]*>)', original_html, re.DOTALL)
+    if not m_open:
+        return inner
+    opening_tag = m_open.group(1)
+    tag_name    = m_open.group(2)
+    return f'{opening_tag}{inner}</{tag_name}>'
+
+
 class TranslatorApp(QMainWindow):
     _download_done_signal = pyqtSignal(str, str, str)
 
@@ -260,17 +631,31 @@ class TranslatorApp(QMainWindow):
         self.last_checked_row: Optional[int] = None
         self.is_session_loaded: bool = False
 
+        self._eta_chars_done: int = 0
+        self._eta_chars_total: int = 0
+        self._eta_session_start: Optional[float] = None
+        self._eta_recent_times: List[float] = []
+
         self.translation_timer = QTimer()
         self.translation_timer.timeout.connect(self.update_translation_time)
         self.translation_start_time: Optional[float] = None
         self.current_fragment_index: Optional[int] = None
 
         self.current_worker: Optional[QThread] = None
+        self._alignment_worker: Optional[AlignmentWorkerThread] = None
+        self._alignment_cancelled: bool = False
+        self._alignment_total: int = 0
+        self._alignment_completed: int = 0
         self.epub_creator: Optional[EPUBCreatorLxml] = None
         self.srt_creator: Optional[SRTCreator] = None
         self.txt_creator: Optional[TXTCreator] = None
 
         self._download_done_signal.connect(self._on_download_done_slot)
+
+        self._preview_engine = EPUBPreviewEngine()
+        self._preview_show_original_ids: set = set()
+        self._preview_dark_mode: bool = False
+        self._reader_window: EPUBReaderWindow = None
 
         self.init_ui()
 
@@ -539,6 +924,60 @@ class TranslatorApp(QMainWindow):
         show_buttons.addWidget(btn_show_mismatch)
         left_layout.addLayout(show_buttons)
 
+        ALIGN_BTN = """
+            QPushButton {
+                background-color: #252525;
+                color: #bbbbbb;
+                border: 1px solid #3c3c3c;
+                border-radius: 3px;
+                padding: 3px 6px;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #333; color: white; border-color: #555; }
+            QPushButton:pressed { background-color: #1a1a1a; }
+        """
+        self._alignment_filter_row = QWidget()
+        align_filter_layout = QHBoxLayout(self._alignment_filter_row)
+        align_filter_layout.setSpacing(3)
+        align_filter_layout.setContentsMargins(0, 0, 0, 0)
+
+        btn_af_green = QPushButton("🟢")
+        btn_af_green.setToolTip("Auto-wrap or manually confirmed (100% certain)")
+        btn_af_green.setStyleSheet(ALIGN_BTN)
+        btn_af_green.clicked.connect(lambda: self._filter_alignment_dot('🟢'))
+
+        btn_af_yellow = QPushButton("🟡")
+        btn_af_yellow.setToolTip("Neural model, < 2 corrections (probably OK)")
+        btn_af_yellow.setStyleSheet(ALIGN_BTN)
+        btn_af_yellow.clicked.connect(lambda: self._filter_alignment_dot('🟡'))
+
+        btn_af_orange = QPushButton("🟠")
+        btn_af_orange.setToolTip("Neural model, ≥ 2 corrections (worth checking)")
+        btn_af_orange.setStyleSheet(ALIGN_BTN)
+        btn_af_orange.clicked.connect(lambda: self._filter_alignment_dot('🟠'))
+
+        btn_af_black = QPushButton("⚫")
+        btn_af_black.setToolTip("No inline tags in original (alignment N/A)")
+        btn_af_black.setStyleSheet(ALIGN_BTN)
+        btn_af_black.clicked.connect(lambda: self._filter_alignment_dot('⚫'))
+
+        btn_af_red = QPushButton("🔴")
+        btn_af_red.setToolTip("Manually flagged as bad")
+        btn_af_red.setStyleSheet(ALIGN_BTN)
+        btn_af_red.clicked.connect(lambda: self._filter_alignment_dot('🔴'))
+
+        btn_af_pending = QPushButton("○")
+        btn_af_pending.setToolTip("Translated but alignment not yet run")
+        btn_af_pending.setStyleSheet(ALIGN_BTN)
+        btn_af_pending.clicked.connect(lambda: self._filter_alignment_dot('none'))
+
+        for btn in (btn_af_green, btn_af_yellow, btn_af_orange,
+                    btn_af_black, btn_af_red, btn_af_pending):
+            align_filter_layout.addWidget(btn)
+
+        self._alignment_filter_row.setVisible(False)
+        left_layout.addWidget(self._alignment_filter_row)
+
         search_layout = QHBoxLayout()
         search_layout.setSpacing(4)
 
@@ -611,8 +1050,10 @@ class TranslatorApp(QMainWindow):
 
         bottom_left_layout = QVBoxLayout()
         bottom_left_layout.setSpacing(4)
-        row_layout = QHBoxLayout()
-        row_layout.setSpacing(6)
+
+        grid_layout = QGridLayout()
+        grid_layout.setSpacing(6)
+        grid_layout.setColumnStretch(3, 1)
 
         self.auto_fix_checkbox = QCheckBox("Auto-fix mismatch")
         self.auto_fix_checkbox.setToolTip(
@@ -624,18 +1065,18 @@ class TranslatorApp(QMainWindow):
             "• Returns the best result across all attempts"
         )
         self.auto_fix_checkbox.setStyleSheet(CHECKBOX_STYLE)
-        row_layout.addWidget(self.auto_fix_checkbox)
+        grid_layout.addWidget(self.auto_fix_checkbox, 0, 0)
 
         lbl_auto_fix_tries = QLabel("Attempts:")
         lbl_auto_fix_tries.setStyleSheet("color: #888; font-size: 11px;")
-        row_layout.addWidget(lbl_auto_fix_tries)
+        grid_layout.addWidget(lbl_auto_fix_tries, 0, 1)
 
         self.auto_fix_spinbox = QSpinBox()
         self.auto_fix_spinbox.setRange(1, 10)
         self.auto_fix_spinbox.setValue(3)
         self.auto_fix_spinbox.setFixedWidth(70)
         self.auto_fix_spinbox.setStyleSheet(SPINBOX_STYLE)
-        row_layout.addWidget(self.auto_fix_spinbox)
+        grid_layout.addWidget(self.auto_fix_spinbox, 0, 2)
 
         self.btn_cancel = QPushButton("✖ Cancel")
         self._hard_cancel_mode = False
@@ -649,8 +1090,41 @@ class TranslatorApp(QMainWindow):
             }
             QPushButton:hover { background-color: #6a2222; color: white; }
         """)
-        row_layout.addWidget(self.btn_cancel)
-        bottom_left_layout.addLayout(row_layout)
+        grid_layout.addWidget(self.btn_cancel, 0, 3, 1, 2)
+
+        self.sentence_batch_checkbox = QCheckBox("Sentence batching")
+        self.sentence_batch_checkbox.setToolTip(
+            "Combine multiple paragraphs into one LLM request.\n"
+            "Faster translation by reducing API call overhead.\n"
+            "Works in both Legacy and Inline mode.\n"
+            "Paragraphs from different chapters are never merged."
+        )
+        self.sentence_batch_checkbox.setStyleSheet(CHECKBOX_STYLE)
+        grid_layout.addWidget(self.sentence_batch_checkbox, 1, 0)
+
+        self._lbl_batch_size = QLabel("Batch size:")
+        self._lbl_batch_size.setStyleSheet("color: #888; font-size: 11px;")
+        grid_layout.addWidget(self._lbl_batch_size, 1, 1)
+
+        self.batch_size_spinbox = QSpinBox()
+        self.batch_size_spinbox.setRange(2, 20)
+        self.batch_size_spinbox.setValue(5)
+        self.batch_size_spinbox.setFixedWidth(70)
+        self.batch_size_spinbox.setStyleSheet(SPINBOX_STYLE)
+        grid_layout.addWidget(self.batch_size_spinbox, 1, 2)
+
+        def _on_batch_checkbox_changed(state):
+            enabled = self.sentence_batch_checkbox.isChecked()
+            self.batch_size_spinbox.setEnabled(enabled)
+            self._lbl_batch_size.setEnabled(enabled)
+            self._update_context_visibility()
+            if hasattr(self, 'llm_editor_container') and self.llm_editor_container.isVisible():
+                self.update_llm_editor_content()
+
+        self.sentence_batch_checkbox.stateChanged.connect(_on_batch_checkbox_changed)
+        _on_batch_checkbox_changed(False)
+
+        bottom_left_layout.addLayout(grid_layout)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -662,6 +1136,12 @@ class TranslatorApp(QMainWindow):
             QProgressBar::chunk { background-color: #2a6aaa; border-radius: 2px; }
         """)
         bottom_left_layout.addWidget(self.progress_bar)
+
+        self.eta_label = QLabel("")
+        self.eta_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.eta_label.setVisible(False)
+        bottom_left_layout.addWidget(self.eta_label)
+
         left_layout.addLayout(bottom_left_layout)
 
         splitter.addWidget(left_widget)
@@ -670,6 +1150,24 @@ class TranslatorApp(QMainWindow):
         right_layout = QVBoxLayout(right_widget)
         right_layout.setSpacing(6)
         right_layout.setContentsMargins(4, 0, 0, 0)
+
+        self.panel_tabs = QTabWidget()
+        self.panel_tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #2e2e2e; border-radius: 3px; }
+            QTabBar::tab {
+                background-color: #1e1e1e; color: #777;
+                padding: 5px 14px;
+                border-top-left-radius: 3px; border-top-right-radius: 3px;
+                border: 1px solid #2e2e2e; border-bottom: none; margin-right: 2px;
+            }
+            QTabBar::tab:selected { background-color: #252525; color: #ccc; }
+            QTabBar::tab:hover { background-color: #2a2a2a; color: #aaa; }
+        """)
+
+        translation_tab = QWidget()
+        translation_tab_layout = QVBoxLayout(translation_tab)
+        translation_tab_layout.setContentsMargins(0, 4, 0, 0)
+        translation_tab_layout.setSpacing(0)
 
         preview_splitter = QSplitter(Qt.Orientation.Horizontal)
         preview_splitter.setHandleWidth(5)
@@ -691,44 +1189,124 @@ class TranslatorApp(QMainWindow):
         trans_layout = QVBoxLayout(trans_container)
         trans_layout.setContentsMargins(0, 0, 0, 0)
         trans_layout.setSpacing(4)
-        trans_lbl = QLabel("Translation  (editable)")
-        trans_lbl.setStyleSheet(LABEL_STYLE)
-        trans_layout.addWidget(trans_lbl)
+        self.trans_lbl = QLabel("TRANSLATION  (EDITABLE)")
+        self.trans_lbl.setStyleSheet(LABEL_STYLE)
+        trans_layout.addWidget(self.trans_lbl)
         self.translated_text_view = QTextEdit()
         self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
         self.translated_text_view.setStyleSheet(TEXT_VIEW_STYLE)
         trans_layout.addWidget(self.translated_text_view)
         preview_splitter.addWidget(trans_container)
 
-        right_layout.addWidget(preview_splitter, stretch=1)
+        translation_tab_layout.addWidget(preview_splitter, stretch=1)
+        self.panel_tabs.addTab(translation_tab, "Translation")
 
-        controls_bar = QWidget()
-        controls_bar.setStyleSheet(
+        alignment_tab = QWidget()
+        alignment_tab_layout = QVBoxLayout(alignment_tab)
+        alignment_tab_layout.setContentsMargins(0, 4, 0, 0)
+        alignment_tab_layout.setSpacing(0)
+
+        alignment_splitter = QSplitter(Qt.Orientation.Horizontal)
+        alignment_splitter.setHandleWidth(5)
+
+        orig_html_container = QWidget()
+        orig_html_layout = QVBoxLayout(orig_html_container)
+        orig_html_layout.setContentsMargins(0, 0, 0, 0)
+        orig_html_layout.setSpacing(4)
+        orig_html_lbl = QLabel("Original HTML (source of tags — read only)")
+        orig_html_lbl.setStyleSheet(LABEL_STYLE)
+        orig_html_layout.addWidget(orig_html_lbl)
+        self.alignment_original_view = QPlainTextEdit()
+        self.alignment_original_view.setReadOnly(True)
+        self.alignment_original_view.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #161616; color: #9090a0;
+                border: 1px solid #2e2e2e; border-radius: 4px;
+                padding: 8px; font-size: 12px; font-family: monospace;
+            }
+        """)
+        orig_html_layout.addWidget(self.alignment_original_view)
+        alignment_splitter.addWidget(orig_html_container)
+
+        aligned_result_container = QWidget()
+        aligned_result_layout = QVBoxLayout(aligned_result_container)
+        aligned_result_layout.setContentsMargins(0, 0, 0, 0)
+        aligned_result_layout.setSpacing(4)
+        aligned_result_lbl = QLabel("Alignment result — translation with inserted tags")
+        aligned_result_lbl.setStyleSheet(LABEL_STYLE)
+        aligned_result_layout.addWidget(aligned_result_lbl)
+        self.alignment_result_view = QTextEdit()
+        self.alignment_result_view.setStyleSheet(TEXT_VIEW_STYLE)
+        self.alignment_result_view.setPlaceholderText("Run Alignment to see results")
+        self.alignment_result_view.textChanged.connect(self._on_alignment_result_edited)
+        aligned_result_layout.addWidget(self.alignment_result_view)
+        alignment_splitter.addWidget(aligned_result_container)
+
+        alignment_tab_layout.addWidget(alignment_splitter, stretch=1)
+        self.panel_tabs.addTab(alignment_tab, "Alignment")
+        self.panel_tabs.setTabVisible(1, False)
+
+        preview_tab = QWidget()
+        preview_tab_layout = QVBoxLayout(preview_tab)
+        preview_tab_layout.setContentsMargins(0, 4, 0, 0)
+        preview_tab_layout.setSpacing(0)
+
+        self._preview_toolbar = EPUBPreviewToolbar()
+        self._preview_toolbar.refresh_requested.connect(self.refresh_preview)
+        self._preview_toolbar.chapter_changed.connect(self._on_preview_chapter_changed)
+        self._preview_toolbar.dark_mode_toggled.connect(self._on_preview_dark_mode_toggled)
+        self._preview_toolbar.reader_requested.connect(self._on_open_reader)
+        preview_tab_layout.addWidget(self._preview_toolbar)
+
+        self.epub_preview_view = QWebEngineView()
+        self._preview_page = EPUBPreviewPage(self.epub_preview_view)
+        self._preview_page.fragment_selected.connect(self._on_preview_fragment_clicked)
+        self._preview_page.contextmenu_requested.connect(self._on_preview_contextmenu)
+        self.epub_preview_view.setPage(self._preview_page)
+        self.epub_preview_view.setStyleSheet(
+            "QWebEngineView { background-color: #ffffff; border: none; }"
+        )
+        self.epub_preview_view.setHtml(
+            '<html><body style="background:#1a1a1a;margin:0;padding:24px;">'
+            '<p style="color:#666;font-family:sans-serif;font-size:13px;">'
+            'Select an EPUB fragment from the list to see the visual preview.'
+            '</p></body></html>'
+        )
+        preview_tab_layout.addWidget(self.epub_preview_view, stretch=1)
+        self.panel_tabs.addTab(preview_tab, "Preview")
+        self.panel_tabs.setTabVisible(2, False)
+
+        self.panel_tabs.currentChanged.connect(self._on_panel_tab_changed)
+
+        right_layout.addWidget(self.panel_tabs, stretch=1)
+
+        self.controls_bar = QWidget()
+        self.controls_bar.setStyleSheet(
             "background-color: #1c1c1c; border: 1px solid #2e2e2e; border-radius: 5px;"
         )
-        controls_bar_layout = QVBoxLayout(controls_bar)
+        controls_bar_layout = QVBoxLayout(self.controls_bar)
         controls_bar_layout.setContentsMargins(8, 6, 8, 6)
         controls_bar_layout.setSpacing(6)
 
         qt_row = QHBoxLayout()
         qt_row.setSpacing(6)
 
-        btn_copy_original = QPushButton("→  Copy Original")
-        btn_copy_original.setToolTip("Copy original text to translation field")
-        btn_copy_original.clicked.connect(self.copy_original_to_translation)
-        btn_copy_original.setStyleSheet("""
+        self.btn_copy_original = QPushButton("→  Copy Original")
+        self.btn_copy_original.setToolTip("Copy original text to translation field")
+        self.btn_copy_original.clicked.connect(self.copy_original_to_translation)
+        self.btn_copy_original.setStyleSheet("""
             QPushButton {
                 background-color: #2a2a2a; color: #aaa;
                 border: 1px solid #444; border-radius: 3px; padding: 4px 10px; font-size: 11px;
             }
             QPushButton:hover { background-color: #333; color: white; }
         """)
-        qt_row.addWidget(btn_copy_original)
+        qt_row.addWidget(self.btn_copy_original)
 
-        sep1 = QFrame()
-        sep1.setFrameShape(QFrame.Shape.VLine)
-        sep1.setStyleSheet("color: #333;")
-        qt_row.addWidget(sep1)
+        self._qt_sep1 = QFrame()
+        self._qt_sep1.setFrameShape(QFrame.Shape.VLine)
+        self._qt_sep1.setStyleSheet("color: #333;")
+        qt_row.addWidget(self._qt_sep1)
 
         self.quick_translate_service_combo = QComboBox()
         self.quick_translate_service_combo.addItems(["Google (Free)", "DeepL Free", "DeepL Pro"])
@@ -736,38 +1314,38 @@ class TranslatorApp(QMainWindow):
         self.quick_translate_service_combo.setStyleSheet(COMBO_STYLE)
         qt_row.addWidget(self.quick_translate_service_combo)
 
-        lbl_from = QLabel("From:")
-        lbl_from.setStyleSheet("color: #777; font-size: 11px;")
-        qt_row.addWidget(lbl_from)
+        self._qt_lbl_from = QLabel("From:")
+        self._qt_lbl_from.setStyleSheet("color: #777; font-size: 11px;")
+        qt_row.addWidget(self._qt_lbl_from)
 
         self.source_lang_combo = QComboBox()
         for n, c in LanguageConstants.SOURCE_LANGUAGES:
-            self.source_lang_combo.addItem(c)
-            self.source_lang_combo.setItemData(self.source_lang_combo.count() - 1, n, Qt.ItemDataRole.ToolTipRole)
-        self.source_lang_combo.setCurrentText("EN")
-        self.source_lang_combo.setMaximumWidth(68)
+            self.source_lang_combo.addItem(n)
+            self.source_lang_combo.setItemData(self.source_lang_combo.count() - 1, c, Qt.ItemDataRole.UserRole)
+        self.source_lang_combo.setCurrentText("English")
+        self.source_lang_combo.setMaximumWidth(180)
         self.source_lang_combo.setStyleSheet(COMBO_STYLE)
         qt_row.addWidget(self.source_lang_combo)
 
-        lbl_arrow = QLabel("→")
-        lbl_arrow.setStyleSheet("color: #555; font-size: 13px;")
-        qt_row.addWidget(lbl_arrow)
+        self._qt_lbl_arrow = QLabel("→")
+        self._qt_lbl_arrow.setStyleSheet("color: #555; font-size: 13px;")
+        qt_row.addWidget(self._qt_lbl_arrow)
 
-        lbl_to = QLabel("To:")
-        lbl_to.setStyleSheet("color: #777; font-size: 11px;")
-        qt_row.addWidget(lbl_to)
+        self._qt_lbl_to = QLabel("To:")
+        self._qt_lbl_to.setStyleSheet("color: #777; font-size: 11px;")
+        qt_row.addWidget(self._qt_lbl_to)
 
         self.target_lang_combo = QComboBox()
         for n, c in LanguageConstants.TARGET_LANGUAGES:
-            self.target_lang_combo.addItem(c)
-            self.target_lang_combo.setItemData(self.target_lang_combo.count() - 1, n, Qt.ItemDataRole.ToolTipRole)
-        self.target_lang_combo.setCurrentText("PL")
-        self.target_lang_combo.setMaximumWidth(68)
+            self.target_lang_combo.addItem(n)
+            self.target_lang_combo.setItemData(self.target_lang_combo.count() - 1, c, Qt.ItemDataRole.UserRole)
+        self.target_lang_combo.setCurrentText("Polish")
+        self.target_lang_combo.setMaximumWidth(180)
         self.target_lang_combo.setStyleSheet(COMBO_STYLE)
         qt_row.addWidget(self.target_lang_combo)
 
-        btn_quick_translate = QPushButton("Translate")
-        btn_quick_translate.setStyleSheet("""
+        self.btn_quick_translate = QPushButton("Translate")
+        self.btn_quick_translate.setStyleSheet("""
             QPushButton {
                 background-color: #1a4a7a; color: white;
                 font-weight: bold; padding: 5px 14px;
@@ -776,8 +1354,8 @@ class TranslatorApp(QMainWindow):
             QPushButton:hover { background-color: #2a5a9a; }
             QPushButton:pressed { background-color: #0a3a6a; }
         """)
-        btn_quick_translate.clicked.connect(self.translate_with_quick_service)
-        qt_row.addWidget(btn_quick_translate)
+        self.btn_quick_translate.clicked.connect(self.translate_with_quick_service)
+        qt_row.addWidget(self.btn_quick_translate)
 
         qt_row.addStretch()
 
@@ -786,9 +1364,9 @@ class TranslatorApp(QMainWindow):
         sep2.setStyleSheet("color: #333;")
         qt_row.addWidget(sep2)
 
-        btn_mark_correct = QPushButton("✓  Mark Correct")
-        btn_mark_correct.setToolTip("Mark selected fragment as correct (ignore mismatch)")
-        btn_mark_correct.setStyleSheet("""
+        self.btn_mark_correct = QPushButton("✓  Mark Correct")
+        self.btn_mark_correct.setToolTip("Mark selected fragment as correct (ignore mismatch)")
+        self.btn_mark_correct.setStyleSheet("""
             QPushButton {
                 background-color: #1e3d0a; color: #88dd44;
                 border: 1px solid #3a6a15; border-radius: 3px; padding: 4px 10px;
@@ -796,12 +1374,12 @@ class TranslatorApp(QMainWindow):
             }
             QPushButton:hover { background-color: #2a5a12; color: #aaff66; }
         """)
-        btn_mark_correct.clicked.connect(self.mark_fragment_as_correct)
-        qt_row.addWidget(btn_mark_correct)
+        self.btn_mark_correct.clicked.connect(self.mark_fragment_as_correct)
+        qt_row.addWidget(self.btn_mark_correct)
 
-        btn_unmark_correct = QPushButton("✗  Unmark")
-        btn_unmark_correct.setToolTip("Remove 'correct' flag and recheck mismatch")
-        btn_unmark_correct.setStyleSheet("""
+        self.btn_unmark_correct = QPushButton("✗  Unmark")
+        self.btn_unmark_correct.setToolTip("Remove 'correct' flag and recheck mismatch")
+        self.btn_unmark_correct.setStyleSheet("""
             QPushButton {
                 background-color: #3a0e0e; color: #dd6666;
                 border: 1px solid #662020; border-radius: 3px; padding: 4px 10px;
@@ -809,13 +1387,15 @@ class TranslatorApp(QMainWindow):
             }
             QPushButton:hover { background-color: #5a1515; color: #ff8888; }
         """)
-        btn_unmark_correct.clicked.connect(self.unmark_fragment_as_correct)
-        qt_row.addWidget(btn_unmark_correct)
+        self.btn_unmark_correct.clicked.connect(self.unmark_fragment_as_correct)
+        qt_row.addWidget(self.btn_unmark_correct)
 
         controls_bar_layout.addLayout(qt_row)
-        right_layout.addWidget(controls_bar)
+        right_layout.addWidget(self.controls_bar)
 
-        llm_options_layout = QVBoxLayout()
+        self.llm_options_widget = QWidget()
+        llm_options_layout = QVBoxLayout(self.llm_options_widget)
+        llm_options_layout.setContentsMargins(0, 0, 0, 0)
         llm_options_layout.setSpacing(4)
 
         llm_buttons_layout = QHBoxLayout()
@@ -863,25 +1443,7 @@ class TranslatorApp(QMainWindow):
             lbl.setStyleSheet(PARAM_LABEL + " background: transparent; border: none;")
             params_group_layout.addWidget(lbl)
             params_group_layout.addWidget(widget)
-
-        self.context_before_spinbox = QSpinBox()
-        self.context_before_spinbox.setRange(0, 99999)
-        self.context_before_spinbox.setValue(3)
-        self.context_before_spinbox.setFixedWidth(78)
-        self.context_before_spinbox.setStyleSheet(SPINBOX_STYLE)
-        param_pair("📄  Prev paragraphs:", self.context_before_spinbox)
-
-        self.context_after_spinbox = QSpinBox()
-        self.context_after_spinbox.setRange(0, 99999)
-        self.context_after_spinbox.setValue(2)
-        self.context_after_spinbox.setFixedWidth(78)
-        self.context_after_spinbox.setStyleSheet(SPINBOX_STYLE)
-        param_pair("Next paragraphs:", self.context_after_spinbox)
-
-        sep_v1 = QFrame()
-        sep_v1.setFrameShape(QFrame.Shape.VLine)
-        sep_v1.setStyleSheet("background-color: #333; border: none; max-width: 1px;")
-        params_group_layout.addWidget(sep_v1)
+            return lbl
 
         self.temperature_spinbox = QDoubleSpinBox()
         self.temperature_spinbox.setRange(0.0, 1.0)
@@ -891,10 +1453,10 @@ class TranslatorApp(QMainWindow):
         self.temperature_spinbox.setStyleSheet(SPINBOX_STYLE)
         param_pair("🌡  Temperature:", self.temperature_spinbox)
 
-        sep_v2 = QFrame()
-        sep_v2.setFrameShape(QFrame.Shape.VLine)
-        sep_v2.setStyleSheet("background-color: #333; border: none; max-width: 1px;")
-        params_group_layout.addWidget(sep_v2)
+        sep_v1 = QFrame()
+        sep_v1.setFrameShape(QFrame.Shape.VLine)
+        sep_v1.setStyleSheet("background-color: #333; border: none; max-width: 1px;")
+        params_group_layout.addWidget(sep_v1)
 
         self.timeout_spinbox = QSpinBox()
         self.timeout_spinbox.setRange(1, 60)
@@ -903,6 +1465,25 @@ class TranslatorApp(QMainWindow):
         self.timeout_spinbox.setToolTip("Max time per fragment before skipping (default: 10 min)")
         self.timeout_spinbox.setStyleSheet(SPINBOX_STYLE)
         param_pair("⏱  Timeout (min):", self.timeout_spinbox)
+
+        sep_v2 = QFrame()
+        sep_v2.setFrameShape(QFrame.Shape.VLine)
+        sep_v2.setStyleSheet("background-color: #333; border: none; max-width: 1px;")
+        params_group_layout.addWidget(sep_v2)
+
+        self.context_before_spinbox = QSpinBox()
+        self.context_before_spinbox.setRange(0, 99999)
+        self.context_before_spinbox.setValue(3)
+        self.context_before_spinbox.setFixedWidth(78)
+        self.context_before_spinbox.setStyleSheet(SPINBOX_STYLE)
+        self._lbl_context_before = param_pair("📄  Prev paragraphs:", self.context_before_spinbox)
+
+        self.context_after_spinbox = QSpinBox()
+        self.context_after_spinbox.setRange(0, 99999)
+        self.context_after_spinbox.setValue(2)
+        self.context_after_spinbox.setFixedWidth(78)
+        self.context_after_spinbox.setStyleSheet(SPINBOX_STYLE)
+        self._lbl_context_after = param_pair("Next paragraphs:", self.context_after_spinbox)
 
         params_group_layout.addStretch()
         editor_container_layout.addWidget(params_group)
@@ -995,9 +1576,11 @@ class TranslatorApp(QMainWindow):
 
         self.llm_editor_container.setVisible(False)
         llm_options_layout.addWidget(self.llm_editor_container)
-        right_layout.addLayout(llm_options_layout)
+        right_layout.addWidget(self.llm_options_widget)
 
-        action_buttons_layout = QHBoxLayout()
+        self.action_buttons_widget = QWidget()
+        action_buttons_layout = QHBoxLayout(self.action_buttons_widget)
+        action_buttons_layout.setContentsMargins(0, 0, 0, 0)
         action_buttons_layout.setSpacing(8)
 
         self.btn_translate = QPushButton("▶  Translate Selected")
@@ -1038,9 +1621,30 @@ class TranslatorApp(QMainWindow):
             QPushButton:pressed { background: #0e4020; }
         """)
 
+        self.btn_alignment = QPushButton("🔡  Run Alignment")
+        self.btn_alignment.clicked.connect(self.start_alignment)
+        self.btn_alignment.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_alignment.setMinimumHeight(38)
+        self.btn_alignment.setVisible(False)
+        self.btn_alignment.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4a2a7a, stop:1 #2e1a50);
+                color: white; font-weight: bold; font-size: 13px;
+                padding: 8px 24px; border-radius: 5px; border: 1px solid #7a4aaa;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #6a3a9a, stop:1 #3e2a70);
+                border-color: #9a6acc;
+            }
+            QPushButton:pressed { background: #1e0e40; }
+        """)
+
         action_buttons_layout.addWidget(self.btn_translate)
         action_buttons_layout.addWidget(self.btn_save_file)
-        right_layout.addLayout(action_buttons_layout)
+        action_buttons_layout.addWidget(self.btn_alignment)
+        right_layout.addWidget(self.action_buttons_widget)
 
         splitter.addWidget(right_widget)
         splitter.setSizes([300, 900])
@@ -1824,16 +2428,21 @@ class TranslatorApp(QMainWindow):
         )
         epub_outer_layout.addWidget(inline_tags_group)
 
+        self.alignment_section_widget = QWidget()
+        alignment_section_layout = QVBoxLayout(self.alignment_section_widget)
+        alignment_section_layout.setContentsMargins(0, 0, 0, 0)
+        alignment_section_layout.setSpacing(4)
+
         sep_epub = QFrame()
         sep_epub.setFrameShape(QFrame.Shape.HLine)
         sep_epub.setStyleSheet("color: #2e2e2e; margin: 4px 0;")
-        epub_outer_layout.addWidget(sep_epub)
+        alignment_section_layout.addWidget(sep_epub)
 
         alignment_title_lbl = QLabel("🔡  Alignment Settings  (EPUB Legacy Mode only)")
         alignment_title_lbl.setStyleSheet(
             "color: #9977cc; font-size: 12px; font-weight: bold; margin-bottom: 2px;"
         )
-        epub_outer_layout.addWidget(alignment_title_lbl)
+        alignment_section_layout.addWidget(alignment_title_lbl)
 
         alignment_desc = QLabel(
             "Automatically transfers inline tags (&lt;i&gt;, &lt;b&gt;, &lt;span&gt;, etc.) "
@@ -1843,7 +2452,7 @@ class TranslatorApp(QMainWindow):
         )
         alignment_desc.setWordWrap(True)
         alignment_desc.setStyleSheet("color: #8877aa; font-size: 11px;")
-        epub_outer_layout.addWidget(alignment_desc)
+        alignment_section_layout.addWidget(alignment_desc)
 
         alignment_form = QFormLayout()
         alignment_form.setSpacing(8)
@@ -1890,13 +2499,13 @@ class TranslatorApp(QMainWindow):
         )
         self.alignment_model_edit.textChanged.connect(self._refresh_alignment_status)
         alignment_form.addRow(align_label("HF Model:"), self.alignment_model_edit)
-        epub_outer_layout.addLayout(alignment_form)
+        alignment_section_layout.addLayout(alignment_form)
 
         models_dir = self._get_models_dir()
         self.alignment_path_label = QLabel(f"Models folder: {models_dir}")
         self.alignment_path_label.setWordWrap(True)
         self.alignment_path_label.setStyleSheet("color: #445544; font-size: 10px; margin-top: 2px;")
-        epub_outer_layout.addWidget(self.alignment_path_label)
+        alignment_section_layout.addWidget(self.alignment_path_label)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
@@ -1922,12 +2531,19 @@ class TranslatorApp(QMainWindow):
         btn_download_model.clicked.connect(self._on_download_alignment_model)
         btn_row.addWidget(btn_download_model)
         btn_row.addStretch()
-        epub_outer_layout.addLayout(btn_row)
+        alignment_section_layout.addLayout(btn_row)
 
         self.alignment_status_label = QLabel("")
         self.alignment_status_label.setWordWrap(True)
         self.alignment_status_label.setStyleSheet("color: #556655; font-size: 10px;")
-        epub_outer_layout.addWidget(self.alignment_status_label)
+        alignment_section_layout.addWidget(self.alignment_status_label)
+
+        epub_outer_layout.addWidget(self.alignment_section_widget)
+
+        self.alignment_section_widget.setVisible(not self.inline_formatting_checkbox.isChecked())
+        self.inline_formatting_checkbox.stateChanged.connect(
+            lambda: self.alignment_section_widget.setVisible(not self.inline_formatting_checkbox.isChecked())
+        )
 
         outer_layout.addWidget(
             make_collapsible("📖  EPUB Settings  (Inline / Legacy + Alignment)", epub_content,
@@ -2074,6 +2690,12 @@ class TranslatorApp(QMainWindow):
         else:
             logger.info(f"{self.file_type.upper()} loaded – inline formatting not applicable (EPUB only)")
 
+        if hasattr(self, 'sentence_batch_checkbox'):
+            is_epub = self.file_type == 'epub'
+            self.sentence_batch_checkbox.setEnabled(is_epub)
+            if not is_epub:
+                self.sentence_batch_checkbox.setChecked(False)
+
         self._initialize_components()
 
         self.populate_list()
@@ -2082,6 +2704,69 @@ class TranslatorApp(QMainWindow):
         self.update_llm_editor_content()
 
         self._update_status_after_file_load()
+
+    def _get_dot_for_para(self, para):
+        """
+        Return the alignment dot emoji for a paragraph, or None if not applicable.
+        Mirrors the logic in _update_item_visuals.
+        """
+        if not (self.file_type == 'epub' and para.get('processing_mode') == 'legacy'):
+            return None
+        if not para.get('is_translated'):
+            return None
+        original_html = para.get('original_html', '')
+        has_inline = any(
+            f'<{tag}' in original_html or f'<{tag}>' in original_html
+            for tag in INLINE_TRANSFER_TAGS
+        )
+        if para.get('alignment_force_correct'):
+            return '🟢'
+        if para.get('alignment_force_bad'):
+            return '🔴'
+        if not has_inline:
+            return '⚫'
+        if para.get('aligned_translated_html'):
+            return '🟢' if para.get('alignment_auto_wrap') else (
+                '🟠' if para.get('alignment_corrections', 0) >= 2 else '🟡'
+            )
+        return '○'
+
+    def _get_paragraphs_for_epub_save(self, output_path):
+        """
+        For Legacy-mode EPUBs that have aligned fragments, show the alignment
+        filter dialog and return a (possibly filtered) copy of self.paragraphs.
+        Returns None if the user cancelled.
+        For non-legacy or un-aligned EPUBs returns self.paragraphs unchanged.
+        """
+        if not self._is_legacy_mode():
+            return self.paragraphs
+
+        counts = {}
+        for para in self.paragraphs:
+            dot = self._get_dot_for_para(para)
+            if dot:
+                counts[dot] = counts.get(dot, 0) + 1
+
+        alignable = {'🟢', '🟡', '🟠'}
+        if not any(d in counts for d in alignable):
+            return self.paragraphs
+
+        dlg = AlignmentSaveDialog(counts, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        include_dots = dlg.selected_dots()
+
+        result = []
+        for para in self.paragraphs:
+            dot = self._get_dot_for_para(para)
+            if dot == '🔴' or (dot in alignable and dot not in include_dots):
+                para_copy = para.copy()
+                para_copy.pop('aligned_translated_html', None)
+                result.append(para_copy)
+            else:
+                result.append(para)
+        return result
 
     def save_file(self):
         if not self.paragraphs:
@@ -2108,98 +2793,15 @@ class TranslatorApp(QMainWindow):
 
         try:
             if self.file_type == "epub":
-                alignment_enabled = False
-                alignment_device = "cpu"
-                alignment_model = "xlm-roberta-large"
-                models_dir = self._get_models_dir()
-
-                is_legacy = (
-                    bool(self.paragraphs)
-                    and self.paragraphs[0].get('processing_mode') == 'legacy'
-                )
-                has_translated = any(
-                    p.get('is_translated') for p in self.paragraphs
-                )
-
-                if is_legacy and has_translated:
-                    alignment_model = self.alignment_model_edit.text().strip()
-                    if not alignment_model:
-                        alignment_model = "xlm-roberta-large"
-                    alignment_device = self.alignment_device_combo.currentText()
-
-                    model_available_locally = is_model_downloaded(
-                        alignment_model, models_dir
-                    )
-
-                    if model_available_locally:
-                        local_path = get_local_model_path(alignment_model, models_dir)
-                        model_info = (
-                            f"<span style='color: #44aa44;'>Model available locally:</span><br>"
-                            f"<span style='color: #666; font-size: 10px;'>{local_path}</span>"
-                        )
-                    else:
-                        model_info = (
-                            f"<span style='color: #cc8833;'>Model '{alignment_model}' "
-                            f"is not available locally.<br>"
-                            f"It will be downloaded from Hugging Face Hub (internet required).</span>"
-                        )
-
-                    msg = QMessageBox(self)
-                    msg.setWindowTitle("Inline Tag Alignment (mBERT)")
-                    msg.setText(
-                        "<b>Load mBERT model for inline tag alignment?</b><br><br>"
-                        "The model will automatically transfer formatting "
-                        "(&lt;i&gt;, &lt;b&gt;, &lt;span&gt;, etc.) "
-                        "from the original text to the corresponding words in the translation.<br><br>"
-                        f"{model_info}<br><br>"
-                        "Before loading, make sure your LLM session is closed "
-                        "(LM Studio / Ollama shut down) to free up VRAM.<br><br>"
-                        "<span style='color: #666; font-size: 10px;'>"
-                        "Paragraphs without inline tags and those containing reserved elements "
-                        "(img, br) are skipped automatically.</span>"
-                    )
-                    msg.setTextFormat(Qt.TextFormat.RichText)
-                    msg.setIcon(QMessageBox.Icon.Question)
-
-                    yes_btn = msg.addButton(
-                        "Yes, load model",
-                        QMessageBox.ButtonRole.YesRole,
-                    )
-                    skip_btn = msg.addButton(
-                        "Save without alignment",
-                        QMessageBox.ButtonRole.NoRole,
-                    )
-                    cancel_btn = msg.addButton(
-                        "Cancel",
-                        QMessageBox.ButtonRole.RejectRole,
-                    )
-                    msg.setDefaultButton(skip_btn)
-                    msg.exec()
-
-                    clicked = msg.clickedButton()
-
-                    if clicked is cancel_btn:
-                        self.statusBar().showMessage("Save cancelled.", 3000)
-                        return
-
-                    if clicked is yes_btn:
-                        alignment_enabled = True
-                        logger.info(
-                            f"[save_file] Alignment enabled: "
-                            f"model={alignment_model}, device={alignment_device}, "
-                            f"models_dir={models_dir}"
-                        )
+                paragraphs_to_save = self._get_paragraphs_for_epub_save(path)
+                if paragraphs_to_save is None:
+                    return
 
                 self.epub_creator = EPUBCreatorLxml(
                     self.file_processor.book,
-                    self.paragraphs,
+                    paragraphs_to_save,
                     path,
                 )
-
-                self.epub_creator.alignment_enabled = alignment_enabled
-                self.epub_creator.alignment_model_name = alignment_model
-                self.epub_creator.alignment_device = alignment_device
-                self.epub_creator.alignment_models_dir = models_dir
 
                 self.epub_creator.finished.connect(self.on_file_saved)
                 self.epub_creator.start()
@@ -2255,6 +2857,7 @@ class TranslatorApp(QMainWindow):
         self.original_file_path = None
         self.file_type = None
         self.file_processor = None
+        self._preview_show_original_ids.clear()
         self.is_session_loaded = False
         self.last_checked_row = None
 
@@ -2263,9 +2866,29 @@ class TranslatorApp(QMainWindow):
         self.translated_text_view.textChanged.disconnect(self.update_translation_from_edit)
         self.translated_text_view.clear()
         self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
+        if hasattr(self, 'alignment_original_view'):
+            self.alignment_original_view.clear()
+        if hasattr(self, 'alignment_result_view'):
+            self.alignment_result_view.textChanged.disconnect(self._on_alignment_result_edited)
+            self.alignment_result_view.clear()
+            self.alignment_result_view.textChanged.connect(self._on_alignment_result_edited)
+        if hasattr(self, 'panel_tabs'):
+            self.panel_tabs.setTabVisible(1, False)
+            self.panel_tabs.setTabVisible(2, False)
+            if self.panel_tabs.currentIndex() in (1, 2):
+                self.panel_tabs.setCurrentIndex(0)
+        if hasattr(self, 'epub_preview_view'):
+            self.epub_preview_view.setHtml(
+                '<html><body style="background:#1a1a1a;margin:0;padding:24px;">'
+                '<p style="color:#666;font-family:sans-serif;font-size:13px;">'
+                'Select an EPUB fragment from the list to see the visual preview.'
+                '</p></body></html>'
+            )
         self.progress_bar.setVisible(False)
         self.btn_translate.setVisible(True)
         self.btn_save_file.setVisible(True)
+        if hasattr(self, 'btn_alignment'):
+            self.btn_alignment.setVisible(False)
 
         self.update_file_label()
 
@@ -2329,7 +2952,9 @@ class TranslatorApp(QMainWindow):
                 prompt_variant=variant,
                 json_payload_mode=json_payload_mode,
                 json_payload_template=json_payload_template,
-                json_response_field=json_response_field
+                json_response_field=json_response_field,
+                sentence_batch_enabled=self.sentence_batch_checkbox.isChecked() if hasattr(self, 'sentence_batch_checkbox') else False,
+                sentence_batch_size=self.batch_size_spinbox.value() if hasattr(self, 'batch_size_spinbox') else 5
             )
 
             self.show_message("Success", f"Session saved to file:\n{path}")
@@ -2376,6 +3001,11 @@ class TranslatorApp(QMainWindow):
             self.context_after_spinbox.setValue(session_data.get('context_after', 2))
             self.temperature_spinbox.setValue(session_data.get('temperature', 0.8))
 
+            if hasattr(self, 'sentence_batch_checkbox'):
+                self.sentence_batch_checkbox.setChecked(session_data.get('sentence_batch_enabled', False))
+            if hasattr(self, 'batch_size_spinbox'):
+                self.batch_size_spinbox.setValue(session_data.get('sentence_batch_size', 5))
+
             self.inline_formatting_checkbox.blockSignals(True)
             self.inline_formatting_checkbox.setChecked(use_inline)
             self.inline_formatting_checkbox.blockSignals(False)
@@ -2386,6 +3016,7 @@ class TranslatorApp(QMainWindow):
                 checkbox.blockSignals(False)
 
             self.inline_tags_group.setVisible(use_inline)
+            self.alignment_section_widget.setVisible(not use_inline)
 
             if self.file_type == "epub":
                 logger.info(f"Session loaded – EPUB mode: {'inline' if use_inline else 'legacy'}, "
@@ -2479,6 +3110,7 @@ class TranslatorApp(QMainWindow):
             self._initialize_components()
             self.populate_list()
             self.update_file_label()
+            self._update_status_after_file_load()
 
             if self.llm_editor_container.isVisible():
                 self.update_llm_editor_content()
@@ -2564,12 +3196,25 @@ class TranslatorApp(QMainWindow):
         self.translation_cancelled = False
         self.btn_translate.setVisible(False)
         self.btn_save_file.setVisible(False)
+        if hasattr(self, "btn_alignment"):
+            self.btn_alignment.setVisible(False)
         self.total_to_translate = len(selected_items)
         self.completed_translations = 0
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.translation_queue = selected_items.copy()
         self.current_translation_idx = None
+
+        self._eta_session_start = time.time()
+        self._eta_chars_done = 0
+        self._eta_recent_times = []
+        self._eta_chars_total = sum(
+            len(self.paragraphs[i].get('original_text', ''))
+            for i in selected_items
+        )
+        if hasattr(self, 'eta_label'):
+            self.eta_label.setText("")
+            self.eta_label.setVisible(True)
 
         try:
             llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
@@ -2598,17 +3243,19 @@ class TranslatorApp(QMainWindow):
             logger.info(f"Using prompts from cache for variant: {variant}")
 
             is_json_payload = self.json_payload_checkbox.isChecked()
+            batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
 
-            if is_json_payload and hasattr(self, 'json_payload_edit'):
-                json_template = self.json_payload_edit.toPlainText().strip()
-                json_response_field = self.json_response_field_edit.text().strip()
-                prompt_builder = PromptBuilder(
-                    variant=variant,
-                    json_payload_template=json_template,
-                    json_response_field=json_response_field
-                )
-            elif is_json_payload and getattr(self, '_json_payload_content', None):
-                json_template = self._json_payload_content
+            if is_json_payload:
+                if batch_mode:
+                    json_template = ''
+                    if variant and variant in self.current_prompts_cache:
+                        json_template = self.current_prompts_cache[variant].get('batch_json_payload', '')
+                    if not json_template and hasattr(self, 'json_payload_edit'):
+                        json_template = self.json_payload_edit.toPlainText().strip()
+                elif hasattr(self, 'json_payload_edit'):
+                    json_template = self.json_payload_edit.toPlainText().strip()
+                else:
+                    json_template = getattr(self, '_json_payload_content', None) or ''
                 json_response_field = self.json_response_field_edit.text().strip()
                 prompt_builder = PromptBuilder(
                     variant=variant,
@@ -2622,10 +3269,11 @@ class TranslatorApp(QMainWindow):
                     single_prompt_mode=self.single_prompt_checkbox.isChecked()
                 )
             else:
+                asst_template = prompts.get('batch_assistant', '') if batch_mode else prompts['assistant']
                 prompt_builder = PromptBuilder(
                     variant=variant,
                     system_template=prompts['system'],
-                    assistant_template=prompts['assistant'],
+                    assistant_template=asst_template,
                     user_template=prompts['user'],
                     single_prompt_mode=self.single_prompt_checkbox.isChecked()
                 )
@@ -2650,6 +3298,10 @@ class TranslatorApp(QMainWindow):
         if self.translation_cancelled:
             logging.info("Translation cancelled by user - stopping queue")
             self.finalize_translation()
+            return
+
+        if hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked() and self.file_type == 'epub':
+            self._translate_next_batch()
             return
 
         if not self.translation_queue:
@@ -2720,6 +3372,349 @@ class TranslatorApp(QMainWindow):
             self._update_item_visuals(idx)
             self.translate_next_fragment()
 
+    def _translate_next_batch(self):
+        if not self.translation_queue:
+            self.finalize_translation()
+            return
+
+        try:
+            self._translate_next_batch_inner()
+        except Exception as e:
+            logging.error(f"[Batch] Unexpected error in _translate_next_batch: {e}")
+            logging.error(traceback.format_exc())
+            self.translate_next_fragment()
+
+    def _translate_next_batch_inner(self):
+
+        self._batch_mismatch_indices = []
+
+        batch_size = self.batch_size_spinbox.value()
+        first_idx = self.translation_queue[0]
+        first_href = self.paragraphs[first_idx].get('item_href', '')
+
+        batch_indices = []
+        for i, idx in enumerate(self.translation_queue):
+            if i >= batch_size:
+                break
+            para = self.paragraphs[idx]
+            if i > 0 and para.get('item_href', '') != first_href:
+                break
+            if para.get('is_non_translatable', False):
+                break
+            batch_indices.append(idx)
+
+        if not batch_indices:
+            batch_indices = [self.translation_queue[0]]
+
+        for idx in batch_indices:
+            self.translation_queue.remove(idx)
+
+        self._current_batch_indices = batch_indices
+
+        fragments = [self.paragraphs[i] for i in batch_indices]
+
+        context_before = self._get_context(batch_indices[0], before=True, count=self.context_before_spinbox.value())
+        context_after = self._get_context(batch_indices[-1], before=False, count=self.context_after_spinbox.value())
+
+        batcher = SentenceBatcher()
+
+        variant = self._get_current_variant()
+        batch_hint_template = ""
+        if variant and variant in self.current_prompts_cache:
+            batch_hint_template = self.current_prompts_cache[variant].get('batch_hint', '')
+        if not batch_hint_template:
+            from app_utils import PromptManager as _PM
+            batch_hint_template = _PM.get_default_batch_hint_prompt()
+
+        auto_fix_manager = None
+        if self.auto_fix_checkbox.isChecked():
+            auto_fix_manager = AutoFixManager(
+                max_attempts=self.auto_fix_spinbox.value(),
+                base_temperature=self.temperature_spinbox.value()
+            )
+
+        self.translation_start_time = time.time()
+        self.translation_timer.start(1000)
+        self.current_fragment_index = batch_indices[0]
+
+        self.current_worker = TranslationBatchWorkerThread(
+            orchestrator=self.translation_orchestrator,
+            fragments=fragments,
+            indices=batch_indices,
+            context_before=context_before,
+            context_after=context_after,
+            temperature=self.temperature_spinbox.value(),
+            auto_fix_manager=auto_fix_manager,
+            mismatch_checker=self.mismatch_checker,
+            batcher=batcher,
+            batch_hint_template=batch_hint_template
+        )
+
+        self.current_worker.batch_progress.connect(self.on_batch_progress)
+        self.current_worker.finished.connect(self.on_batch_finished)
+        self.current_worker.start()
+
+    def on_batch_progress(self, indices, translations, is_error):
+        chars_translated = 0
+        for idx, translation in zip(indices, translations):
+            if is_error:
+                self.paragraphs[idx]['translated_text'] = translation
+                self.paragraphs[idx]['is_translated'] = False
+            else:
+                if self.formatting_sync:
+                    synced = self.formatting_sync.sync_formatting(
+                        original=self.paragraphs[idx]['original_text'],
+                        translated=translation,
+                        para=self.paragraphs[idx]
+                    )
+                else:
+                    synced = translation
+
+                is_now_translated = bool(synced.strip())
+                self.paragraphs[idx]['translated_text'] = synced
+                self.paragraphs[idx]['is_translated'] = is_now_translated
+
+                self.paragraphs[idx].pop('aligned_translated_html', None)
+                self.paragraphs[idx].pop('alignment_corrections', None)
+                self.paragraphs[idx].pop('alignment_uncertain', None)
+
+                if self.mismatch_checker:
+                    has_mismatch, flags = self.mismatch_checker.check_mismatch(self.paragraphs[idx])
+                    self.paragraphs[idx]['has_mismatch'] = has_mismatch
+                    self.paragraphs[idx]['mismatch_flags'] = flags
+
+                    if has_mismatch:
+                        if not hasattr(self, '_batch_mismatch_indices'):
+                            self._batch_mismatch_indices = []
+                        self._batch_mismatch_indices.append(idx)
+                        logging.info(f"[Batch] Fragment {idx} has mismatch — queued for auto-fix")
+
+                chars_translated += len(self.paragraphs[idx].get('original_text', ''))
+
+            self._update_item_visuals(idx)
+
+        if not is_error and chars_translated > 0:
+            self._update_eta(chars_translated)
+
+        current_item = self.list_widget.currentItem()
+        if current_item:
+            current_idx = current_item.data(Qt.ItemDataRole.UserRole)
+            if current_idx in indices:
+                self.translated_text_view.textChanged.disconnect(self.update_translation_from_edit)
+                self.translated_text_view.setPlainText(
+                    self._format_text_for_display(self.paragraphs[current_idx]['translated_text'])
+                )
+                self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
+
+        if not is_error and self._reader_window is not None:
+            book = getattr(self.file_processor, 'book', None)
+            if book is not None:
+                sel_para = {}
+                current_item = self.list_widget.currentItem()
+                if current_item:
+                    ci = current_item.data(Qt.ItemDataRole.UserRole)
+                    if ci is not None and ci < len(self.paragraphs):
+                        sel_para = self.paragraphs[ci]
+                self._refresh_reader_if_open(book, sel_para)
+
+    def on_batch_finished(self):
+        self.translation_timer.stop()
+
+        if hasattr(self, '_cancellation_prefix'):
+            delattr(self, '_cancellation_prefix')
+
+        batch_indices = getattr(self, '_current_batch_indices', [self.current_fragment_index] if self.current_fragment_index is not None else [])
+
+        for bidx in batch_indices:
+            row = self.para_to_row_map.get(bidx)
+            if row is not None and self.paragraphs[bidx].get('is_translated', False):
+                item = self.list_widget.item(row)
+                if item:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+
+        self.update_file_label()
+
+        if self.current_worker:
+            try:
+                self.current_worker.batch_progress.disconnect()
+                self.current_worker.finished.disconnect()
+            except Exception:
+                pass
+            if self.current_worker.isRunning():
+                self.current_worker.wait(1000)
+            self.current_worker.deleteLater()
+            self.current_worker = None
+
+        if self.translation_cancelled:
+            logging.info("Translation cancelled - stopping after current batch")
+            for _ in batch_indices:
+                self._update_progress()
+            self.finalize_translation()
+            return
+
+        for _ in batch_indices:
+            self._update_progress()
+
+        if (
+            self.auto_fix_checkbox.isChecked()
+            and getattr(self, '_batch_mismatch_indices', [])
+        ):
+            try:
+                self._fix_batch_mismatches()
+            except Exception as e:
+                logging.error(f"[Batch Mismatch Fix] Setup failed: {e} — resuming batch normally")
+                logging.error(traceback.format_exc())
+                self._batch_mismatch_indices = []
+                self.translate_next_fragment()
+        else:
+            self._batch_mismatch_indices = []
+            self.translate_next_fragment()
+
+    def _fix_batch_mismatches(self):
+        self._mismatch_fix_queue = list(self._batch_mismatch_indices)
+        self._batch_mismatch_indices = []
+        logging.info(
+            f"[Batch Mismatch Fix] Starting single-fragment auto-fix for "
+            f"{len(self._mismatch_fix_queue)} fragment(s): {self._mismatch_fix_queue}"
+        )
+        self._fix_next_mismatch()
+
+    def _fix_next_mismatch(self):
+        if self.translation_cancelled:
+            self.finalize_translation()
+            return
+
+        if not getattr(self, '_mismatch_fix_queue', []):
+            logging.info("[Batch Mismatch Fix] All mismatches resolved — resuming batch mode")
+            self.translate_next_fragment()
+            return
+
+        try:
+            idx = self._mismatch_fix_queue.pop(0)
+            self.current_translation_idx = idx
+            self.current_fragment_index = idx
+
+            logging.info(f"[Batch Mismatch Fix] Re-translating fragment {idx} with full auto-fix")
+
+            self.paragraphs[idx]['index'] = idx
+
+            _restore_on = (
+                hasattr(self, 'restore_paragraph_checkbox')
+                and self.restore_paragraph_checkbox.isChecked()
+            )
+            if self.file_type == 'srt':
+                _use_ps = False
+            else:
+                _use_ps = _restore_on
+            self.paragraphs[idx]['use_ps_markers'] = _use_ps
+
+            auto_fix_manager = AutoFixManager(
+                max_attempts=self.auto_fix_spinbox.value(),
+                base_temperature=self.temperature_spinbox.value()
+            )
+
+            context_before = self._get_context(idx, before=True, count=self.context_before_spinbox.value())
+            context_after = self._get_context(idx, before=False, count=self.context_after_spinbox.value())
+
+            self.translation_start_time = time.time()
+            self.current_retry_attempt = 0
+            self.current_max_attempts = self.auto_fix_spinbox.value()
+            self.translation_timer.start(1000)
+
+            self.current_worker = TranslationWorkerThread(
+                orchestrator=self.translation_orchestrator,
+                fragment=self.paragraphs[idx],
+                context_before=context_before,
+                context_after=context_after,
+                temperature=self.temperature_spinbox.value(),
+                auto_fix_manager=auto_fix_manager,
+                mismatch_checker=self.mismatch_checker
+            )
+
+            self.current_worker.progress.connect(self.on_translation_progress)
+            self.current_worker.retry_progress.connect(self.on_retry_progress)
+            self.current_worker.finished.connect(self.on_mismatch_fix_finished)
+            self.current_worker.start()
+
+        except Exception as e:
+            logging.error(f"[Batch Mismatch Fix] Failed to start worker for fragment: {e}")
+            logging.error(traceback.format_exc())
+            # Don't get stuck — continue with next mismatch or resume batch
+            self._fix_next_mismatch()
+
+    def on_mismatch_fix_finished(self):
+        self.translation_timer.stop()
+
+        if hasattr(self, '_cancellation_prefix'):
+            delattr(self, '_cancellation_prefix')
+        if hasattr(self, 'current_retry_attempt'):
+            delattr(self, 'current_retry_attempt')
+        if hasattr(self, 'current_max_attempts'):
+            delattr(self, 'current_max_attempts')
+
+        idx = self.current_translation_idx
+
+        row = self.para_to_row_map.get(idx)
+        if row is not None:
+            item = self.list_widget.item(row)
+            if item and self.paragraphs[idx].get('is_translated', False):
+                item.setCheckState(Qt.CheckState.Unchecked)
+
+        self.update_file_label()
+
+        if self.current_worker:
+            try:
+                self.current_worker.progress.disconnect()
+                self.current_worker.retry_progress.disconnect()
+                self.current_worker.finished.disconnect()
+            except Exception:
+                pass
+            if self.current_worker.isRunning():
+                self.current_worker.wait(1000)
+            self.current_worker.deleteLater()
+            self.current_worker = None
+
+        if self.translation_cancelled:
+            logging.info("[Batch Mismatch Fix] Cancelled — stopping")
+            self.finalize_translation()
+            return
+
+        # Note: _update_progress was already called in on_batch_finished for this
+        # fragment, so we do NOT call it again here to avoid double-counting.
+        self._fix_next_mismatch()
+
+    def _update_eta(self, chars_done: int):
+        self._eta_chars_done += chars_done
+
+        if self._eta_session_start is None:
+            return
+
+        elapsed_total = time.time() - self._eta_session_start
+        if elapsed_total < 1.0 or self._eta_chars_done == 0:
+            return
+
+        chars_per_sec = self._eta_chars_done / elapsed_total
+        chars_left = max(0, self._eta_chars_total - self._eta_chars_done)
+
+        if chars_per_sec <= 0:
+            return
+
+        eta_seconds = int(chars_left / chars_per_sec)
+
+        if eta_seconds < 60:
+            eta_str = f"~{eta_seconds}s"
+        elif eta_seconds < 3600:
+            m, s = divmod(eta_seconds, 60)
+            eta_str = f"~{m}m {s:02d}s"
+        else:
+            h, rem = divmod(eta_seconds, 3600)
+            m = rem // 60
+            eta_str = f"~{h}h {m}m"
+
+        percent = int(self._eta_chars_done / max(self._eta_chars_total, 1) * 100)
+        if hasattr(self, 'eta_label'):
+            self.eta_label.setText(f"ETA: {eta_str}  ({percent}% chars)")
+
     def on_translation_progress(self, idx, translation, is_error):
         if is_error:
             self.paragraphs[idx]['translated_text'] = translation
@@ -2745,12 +3740,19 @@ class TranslatorApp(QMainWindow):
             self.paragraphs[idx]['translated_text'] = synced_translation
             self.paragraphs[idx]['is_translated'] = is_now_translated
 
+            self.paragraphs[idx].pop('aligned_translated_html', None)
+            self.paragraphs[idx].pop('alignment_corrections', None)
+            self.paragraphs[idx].pop('alignment_uncertain', None)
+
             if self.mismatch_checker:
                 has_mismatch, flags = self.mismatch_checker.check_mismatch(self.paragraphs[idx])
                 self.paragraphs[idx]['has_mismatch'] = has_mismatch
                 self.paragraphs[idx]['mismatch_flags'] = flags
 
         self._update_item_visuals(idx)
+
+        if not is_error:
+            self._update_eta(len(self.paragraphs[idx].get('original_text', '')))
 
         current_item = self.list_widget.currentItem()
         if current_item:
@@ -2761,6 +3763,23 @@ class TranslatorApp(QMainWindow):
                     self._format_text_for_display(self.paragraphs[idx]['translated_text'])
                 )
                 self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
+
+        if (
+            hasattr(self, 'panel_tabs')
+            and self.panel_tabs.currentIndex() == 2
+            and self.paragraphs[idx].get('is_translated')
+            and not self.paragraphs[idx].get('has_mismatch', False)
+        ):
+            current_item = self.list_widget.currentItem()
+            if current_item:
+                current_idx = current_item.data(Qt.ItemDataRole.UserRole)
+                if (
+                    current_idx is not None
+                    and current_idx < len(self.paragraphs)
+                    and self.paragraphs[current_idx].get('item_href')
+                        == self.paragraphs[idx].get('item_href')
+                ):
+                    self.refresh_preview()
 
     def on_translation_finished(self):
         self.translation_timer.stop()
@@ -2843,6 +3862,26 @@ class TranslatorApp(QMainWindow):
         """)
 
     def _on_cancel_clicked(self):
+        if hasattr(self, '_alignment_worker') and self._alignment_worker and self._alignment_worker.isRunning():
+            if self._hard_cancel_mode:
+                self._alignment_worker.hard_cancel()
+                self.finalize_alignment()
+            else:
+                self._alignment_worker.request_cancel()
+                self._alignment_cancelled = True
+                self._hard_cancel_mode = True
+                self.btn_cancel.setText("⛔ Hard Cancel")
+                self.btn_cancel.setToolTip("Click: immediately stop alignment.")
+                self.btn_cancel.setStyleSheet("""
+                    QPushButton {
+                        background-color: #6a0000; color: #ff4444;
+                        border: 2px solid #cc0000; border-radius: 4px;
+                        padding: 5px 12px; font-size: 11px; font-weight: bold;
+                    }
+                    QPushButton:hover { background-color: #990000; color: white; }
+                    QPushButton:pressed { background-color: #440000; }
+                """)
+            return
         if self._hard_cancel_mode:
             self._hard_cancel_translation()
         else:
@@ -2868,23 +3907,33 @@ class TranslatorApp(QMainWindow):
         if self.current_worker:
             try:
                 self.current_worker.progress.disconnect()
+            except Exception:
+                pass
+            try:
                 self.current_worker.retry_progress.disconnect()
+            except Exception:
+                pass
+            try:
                 self.current_worker.finished.disconnect()
             except Exception:
                 pass
+            try:
+                self.current_worker.batch_progress.disconnect()
+            except Exception:
+                pass
 
-            if isinstance(self.current_worker, TranslationWorkerThread):
+            if isinstance(self.current_worker, (TranslationWorkerThread, TranslationBatchWorkerThread)):
                 self.current_worker.hard_cancel()
             elif self.current_worker.isRunning():
                 self.current_worker.terminate()
+                self.current_worker.wait(2000)
 
             self.current_worker.deleteLater()
             self.current_worker = None
 
         logging.info("Hard cancel complete")
-
         self.finalize_translation()
-
+    
     def _reset_cancel_button(self):
         if not hasattr(self, 'btn_cancel'):
             return
@@ -2906,6 +3955,12 @@ class TranslatorApp(QMainWindow):
         self.translation_start_time = None
         self.progress_bar.setVisible(False)
 
+        if hasattr(self, 'eta_label'):
+            self.eta_label.setVisible(False)
+        self._eta_session_start = None
+        self._eta_chars_done = 0
+        self._eta_recent_times = []
+
         if self.translation_cancelled:
             self.statusBar().showMessage("⛔ Translation cancelled.", 5000)
             logging.info("Translation process cancelled by user")
@@ -2925,8 +3980,528 @@ class TranslatorApp(QMainWindow):
 
         self.btn_translate.setVisible(True)
         self.btn_save_file.setVisible(True)
+        self._update_alignment_button_visibility()
 
         self._reset_cancel_button()
+
+
+
+    def _is_legacy_mode(self) -> bool:
+        """Returns True if loaded file is EPUB in legacy processing mode."""
+        return (
+            self.file_type == 'epub'
+            and bool(self.paragraphs)
+            and self.paragraphs[0].get('processing_mode') == 'legacy'
+        )
+
+    def _update_alignment_button_visibility(self):
+        """Show/hide btn_alignment and tabs based on file type and mode."""
+        is_legacy = self._is_legacy_mode()
+        is_epub   = self.file_type == 'epub'
+        if hasattr(self, 'btn_alignment'):
+            self.btn_alignment.setVisible(is_legacy)
+        if hasattr(self, 'panel_tabs'):
+            self.panel_tabs.setTabVisible(1, is_legacy)
+            self.panel_tabs.setTabVisible(2, is_epub)
+        if hasattr(self, '_alignment_filter_row'):
+            on_alignment_tab = (
+                hasattr(self, 'panel_tabs')
+                and self.panel_tabs.currentIndex() == 1
+            )
+            self._alignment_filter_row.setVisible(is_legacy and on_alignment_tab)
+
+    def _update_alignment_tab(self, para_index):
+        """Update the Alignment tab fields for the given paragraph index."""
+        if not hasattr(self, 'alignment_original_view'):
+            return
+
+        para = self.paragraphs[para_index] if para_index < len(self.paragraphs) else None
+        if para is None:
+            self.alignment_original_view.setPlainText('')
+            self.alignment_result_view.textChanged.disconnect(self._on_alignment_result_edited)
+            self.alignment_result_view.setPlainText('')
+            self.alignment_result_view.textChanged.connect(self._on_alignment_result_edited)
+            return
+
+        original_html = para.get('original_html', '')
+        self.alignment_original_view.setPlainText(_html_strip_outer_tag(original_html))
+
+        self.alignment_result_view.textChanged.disconnect(self._on_alignment_result_edited)
+        aligned = para.get('aligned_translated_html', '')
+        display_aligned = _html_strip_outer_tag(aligned) if aligned else ''
+        self.alignment_result_view.setPlainText(display_aligned)
+        self.alignment_result_view.textChanged.connect(self._on_alignment_result_edited)
+
+    def _on_alignment_result_edited(self):
+        """Save changes from alignment result editor back to the paragraph."""
+        current_item = self.list_widget.currentItem()
+        if not current_item:
+            return
+        idx = current_item.data(Qt.ItemDataRole.UserRole)
+        if idx is None or idx >= len(self.paragraphs):
+            return
+        edited_inner = self.alignment_result_view.toPlainText()
+        if edited_inner.strip():
+            original_html = self.paragraphs[idx].get('original_html', '')
+            full_html = _html_restore_outer_tag(edited_inner, original_html)
+            self.paragraphs[idx]['aligned_translated_html'] = full_html
+        else:
+            self.paragraphs[idx].pop('aligned_translated_html', None)
+        self._update_item_visuals(idx)
+
+    def start_alignment(self):
+        """Start alignment on selected, translated, non-mismatch paragraphs with inline tags."""
+        models_dir = self._get_models_dir()
+        alignment_model = self.alignment_model_edit.text().strip() or 'xlm-roberta-large'
+
+        if not is_model_downloaded(alignment_model, models_dir):
+            self.show_message(
+                "Model Not Downloaded",
+                f"The alignment model '{alignment_model}' is not available locally.\n\n"
+                "Please download it first in the Options tab → EPUB Settings → "
+                "Alignment Settings → Download / Check Model.",
+                QMessageBox.Icon.Warning
+            )
+            return
+
+        eligible = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            idx = item.data(Qt.ItemDataRole.UserRole)
+            para = self.paragraphs[idx]
+            if not para.get('is_translated'):
+                continue
+            if para.get('has_mismatch'):
+                continue
+            original_html = para.get('original_html', '')
+            has_inline = any(
+                f'<{tag}' in original_html for tag in INLINE_TRANSFER_TAGS
+            )
+            if not has_inline:
+                continue
+            eligible.append(para)
+
+        if not eligible:
+            self.show_message(
+                "Nothing to Align",
+                "No eligible fragments found.\n\n"
+                "Fragments must be:\n"
+                "• Checked (☑) in the list\n"
+                "• Translated\n"
+                "• Without mismatch\n"
+                "• Original HTML must contain inline tags (<i>, <b>, <span>, etc.)",
+                QMessageBox.Icon.Information
+            )
+            return
+
+        device = self.alignment_device_combo.currentText()
+
+        self._alignment_cancelled = False
+        self._alignment_total = len(eligible)
+        self._alignment_completed = 0
+
+        self.btn_translate.setVisible(False)
+        self.btn_save_file.setVisible(False)
+        self.btn_alignment.setVisible(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+
+        self._alignment_worker = AlignmentWorkerThread(
+            paragraphs=eligible,
+            model_name=alignment_model,
+            device=device,
+            models_dir=models_dir,
+        )
+        self._alignment_worker.progress.connect(self._on_alignment_progress)
+        self._alignment_worker.finished.connect(self._on_alignment_finished)
+        self._alignment_worker.start()
+
+        self.statusBar().showMessage(
+            f"Aligning fragment 0 / {self._alignment_total}...", 0
+        )
+
+    def _on_alignment_progress(self, completed, total):
+        self._alignment_completed = completed
+        self.statusBar().showMessage(
+            f"Aligning fragment {completed} / {total}...", 0
+        )
+        percent = int(completed / max(total, 1) * 100)
+        self.progress_bar.setValue(percent)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            self._update_item_visuals(item.data(Qt.ItemDataRole.UserRole))
+        current_item = self.list_widget.currentItem()
+        if current_item:
+            idx = current_item.data(Qt.ItemDataRole.UserRole)
+            self._update_alignment_tab(idx)
+
+    def _on_alignment_finished(self):
+        if self._alignment_worker:
+            try:
+                self._alignment_worker.progress.disconnect()
+                self._alignment_worker.finished.disconnect()
+            except Exception:
+                pass
+            if self._alignment_worker.isRunning():
+                self._alignment_worker.wait(1000)
+            self._alignment_worker.deleteLater()
+            self._alignment_worker = None
+        self.finalize_alignment()
+
+    def finalize_alignment(self):
+        self.progress_bar.setVisible(False)
+
+        if getattr(self, '_alignment_cancelled', False):
+            self.statusBar().showMessage("⛔ Alignment cancelled.", 5000)
+        else:
+            completed = getattr(self, '_alignment_completed', 0)
+            total = getattr(self, '_alignment_total', 0)
+            self.statusBar().showMessage(
+                f"✓ Alignment complete: {completed}/{total} fragments processed.", 5000
+            )
+
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            self._update_item_visuals(item.data(Qt.ItemDataRole.UserRole))
+
+        current_item = self.list_widget.currentItem()
+        if current_item:
+            idx = current_item.data(Qt.ItemDataRole.UserRole)
+            self._update_alignment_tab(idx)
+            self._update_translation_field_state(self.paragraphs[idx])
+
+        self.btn_translate.setVisible(True)
+        self.btn_save_file.setVisible(True)
+        self._update_alignment_button_visibility()
+        self._reset_cancel_button()
+
+
+    def _on_panel_tab_changed(self, index: int):
+        """Handle switching between Translation (0), Alignment (1) and Preview (2) tabs."""
+        is_alignment_tab = (index == 1)
+        is_preview_tab   = (index == 2)
+        hide_translation_controls = is_alignment_tab or is_preview_tab
+
+        for widget in (
+            self.btn_copy_original,
+            self._qt_sep1,
+            self.quick_translate_service_combo,
+            self._qt_lbl_from,
+            self.source_lang_combo,
+            self._qt_lbl_arrow,
+            self._qt_lbl_to,
+            self.target_lang_combo,
+            self.btn_quick_translate,
+        ):
+            if hasattr(self, widget.__class__.__name__) or widget is not None:
+                widget.setVisible(not hide_translation_controls)
+
+        if hasattr(self, '_alignment_filter_row'):
+            show_filter = is_alignment_tab and self._is_legacy_mode()
+            self._alignment_filter_row.setVisible(show_filter)
+            if not is_alignment_tab:
+                self._filter_alignment_dot(None)
+
+        if is_alignment_tab:
+            try:
+                self.btn_mark_correct.clicked.disconnect()
+            except Exception:
+                pass
+            try:
+                self.btn_unmark_correct.clicked.disconnect()
+            except Exception:
+                pass
+            self.btn_mark_correct.setText("🟢  Confirm Alignment")
+            self.btn_mark_correct.setToolTip(
+                "Mark alignment as manually confirmed (🟢 green circle)"
+            )
+            self.btn_unmark_correct.setText("🔴  Flag Alignment")
+            self.btn_unmark_correct.setToolTip(
+                "Flag alignment as incorrect / needs review (🔴 red)"
+            )
+            self.btn_mark_correct.clicked.connect(self._mark_alignment_confirmed)
+            self.btn_unmark_correct.clicked.connect(self._flag_alignment_bad)
+        else:
+            try:
+                self.btn_mark_correct.clicked.disconnect()
+            except Exception:
+                pass
+            try:
+                self.btn_unmark_correct.clicked.disconnect()
+            except Exception:
+                pass
+            self.btn_mark_correct.setText("✓  Mark Correct")
+            self.btn_mark_correct.setToolTip(
+                "Mark selected fragment as correct (ignore mismatch)"
+            )
+            self.btn_unmark_correct.setText("✗  Unmark")
+            self.btn_unmark_correct.setToolTip(
+                "Remove 'correct' flag and recheck mismatch"
+            )
+            self.btn_mark_correct.clicked.connect(self.mark_fragment_as_correct)
+            self.btn_unmark_correct.clicked.connect(self.unmark_fragment_as_correct)
+
+        if is_preview_tab:
+            self.refresh_preview()
+
+        for _widget in (
+            getattr(self, 'controls_bar', None),
+            getattr(self, 'llm_options_widget', None),
+            getattr(self, 'action_buttons_widget', None),
+        ):
+            if _widget is not None:
+                _widget.setVisible(not is_preview_tab)
+
+    def refresh_preview(self):
+        """
+        Regenerate the Preview tab content for the currently selected fragment.
+        Called when the user switches to the Preview tab or selects a new fragment
+        while already on the Preview tab.
+        """
+        if not hasattr(self, 'epub_preview_view'):
+            return
+
+        current_item = self.list_widget.currentItem()
+        if not current_item:
+            self.epub_preview_view.setHtml(
+                '<html><body style="background:#1a1a1a;margin:0;padding:24px;">'
+                '<p style="color:#666;font-family:sans-serif;font-size:13px;">'
+                'No fragment selected.</p></body></html>'
+            )
+            return
+
+        idx = current_item.data(Qt.ItemDataRole.UserRole)
+        if idx is None or not self.paragraphs:
+            return
+
+        book = getattr(self.file_processor, 'book', None)
+        if book is None:
+            self.epub_preview_view.setHtml(
+                '<html><body style="background:#1a1a1a;margin:0;padding:24px;">'
+                '<p style="color:#666;font-family:sans-serif;font-size:13px;">'
+                'No EPUB book object available.</p></body></html>'
+            )
+            return
+
+        selected_para = self.paragraphs[idx]
+
+        try:
+            if hasattr(self, '_preview_toolbar') and self.paragraphs:
+                chapter_list = EPUBPreviewEngine.get_chapter_list(self.paragraphs)
+                current_href = selected_para.get('item_href', '')
+                self._preview_toolbar.set_chapters(chapter_list, current_href)
+
+            html_str = self._preview_engine.generate_preview_html(
+                book, self.paragraphs, selected_para,
+                show_original_ids=self._preview_show_original_ids,
+                dark_mode=self._preview_dark_mode,
+            )
+            base_url = QUrl.fromLocalFile(
+                os.path.abspath(book.content_dir) + os.sep
+            )
+            self.epub_preview_view.setContent(
+                html_str.encode('utf-8'),
+                'application/xhtml+xml',
+                base_url
+            )
+
+            self._refresh_reader_if_open(book, selected_para)
+
+        except Exception as exc:
+            logger.error(f'Preview generation failed: {exc}', exc_info=True)
+            self.epub_preview_view.setHtml(
+                f'<html><body style="background:#1a1a1a;margin:0;padding:24px;">'
+                f'<p style="color:#ff6b6b;font-family:monospace;font-size:13px;">'
+                f'Preview error: {exc}</p></body></html>'
+            )
+
+    def _on_preview_fragment_clicked(self, elem_id: str):
+        """
+        Called when the user clicks a fragment element inside the Preview.
+        Finds the matching paragraph, selects it in the list, and re-renders
+        the preview so the blue highlight moves to the clicked element.
+        """
+        if not self.paragraphs:
+            return
+
+        para_index = None
+        for i, para in enumerate(self.paragraphs):
+            if para.get('id') == elem_id:
+                para_index = i
+                break
+
+        if para_index is None:
+            return
+
+        row = self.para_to_row_map.get(para_index)
+        if row is None:
+            return
+
+        item = self.list_widget.item(row)
+        if item is None:
+            return
+
+        self.list_widget.blockSignals(True)
+        self.list_widget.setCurrentItem(item)
+        self.list_widget.scrollToItem(item, QListWidget.ScrollHint.EnsureVisible)
+        self.list_widget.blockSignals(False)
+
+        idx = para_index
+        self.original_text_view.setPlainText(
+            self._format_text_for_display(self.paragraphs[idx]['original_text'])
+        )
+        self.translated_text_view.textChanged.disconnect(self.update_translation_from_edit)
+        self.translated_text_view.setPlainText(
+            self._format_text_for_display(self.paragraphs[idx]['translated_text'])
+        )
+        self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
+        self._update_alignment_tab(idx)
+        self._update_translation_field_state(self.paragraphs[idx])
+
+        self.refresh_preview()
+
+    def _on_preview_contextmenu(self, elem_id: str):
+        """
+        Show a native context menu when the user right-clicks an element
+        inside the Preview tab.  Offers 'Show Original' / 'Show Translation'
+        depending on the current display state of the element.
+        """
+        if not self.paragraphs:
+            return
+
+        para = next((p for p in self.paragraphs if p.get('id') == elem_id), None)
+        is_translated = (
+            para is not None
+            and para.get('is_translated')
+            and bool(para.get('translated_text', '').strip())
+        )
+
+        menu = QMenu(self)
+
+        if elem_id in self._preview_show_original_ids:
+            act = menu.addAction('Show Translation')
+            act.triggered.connect(lambda: self._preview_toggle_original(elem_id, False))
+        else:
+            act = menu.addAction('Show Original')
+            act.setEnabled(is_translated)
+            act.triggered.connect(lambda: self._preview_toggle_original(elem_id, True))
+
+        menu.exec(QCursor.pos())
+
+    def _preview_toggle_original(self, elem_id: str, show_original: bool):
+        """Add or remove *elem_id* from the 'show original' set and refresh."""
+        if show_original:
+            self._preview_show_original_ids.add(elem_id)
+        else:
+            self._preview_show_original_ids.discard(elem_id)
+        self.refresh_preview()
+
+    def _on_preview_chapter_changed(self, item_href: str):
+        """
+        Navigate to the first paragraph of *item_href* when the user clicks
+        the Prev / Next chapter buttons in the preview toolbar.
+        """
+        if not self.paragraphs:
+            return
+        para_index = EPUBPreviewEngine.first_para_index_for_chapter(
+            self.paragraphs, item_href
+        )
+        if para_index < 0:
+            return
+        row = self.para_to_row_map.get(para_index)
+        if row is None:
+            return
+        item = self.list_widget.item(row)
+        if item is None:
+            return
+        self.list_widget.blockSignals(True)
+        self.list_widget.setCurrentItem(item)
+        self.list_widget.scrollToItem(item, QListWidget.ScrollHint.EnsureVisible)
+        self.list_widget.blockSignals(False)
+
+        idx = para_index
+        self.original_text_view.setPlainText(
+            self._format_text_for_display(self.paragraphs[idx]['original_text'])
+        )
+        self.translated_text_view.textChanged.disconnect(self.update_translation_from_edit)
+        self.translated_text_view.setPlainText(
+            self._format_text_for_display(self.paragraphs[idx]['translated_text'])
+        )
+        self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
+        self._update_alignment_tab(idx)
+        self._update_translation_field_state(self.paragraphs[idx])
+        self._preview_show_original_ids.clear()
+        self.refresh_preview()
+
+    def _on_preview_dark_mode_toggled(self, dark: bool):
+        """Store dark-mode preference and re-render the preview."""
+        self._preview_dark_mode = dark
+        self.refresh_preview()
+
+    def _on_open_reader(self):
+        book = getattr(self.file_processor, 'book', None)
+        if book is None or not self.paragraphs:
+            return
+
+        current_item = self.list_widget.currentItem()
+        idx = current_item.data(Qt.ItemDataRole.UserRole) if current_item else 0
+        if idx is None:
+            idx = 0
+        selected_para = self.paragraphs[idx]
+
+        if self._reader_window is not None:
+            try:
+                self._reader_window.navigate_to_para(book, self.paragraphs, idx)
+                self._reader_window.raise_()
+                self._reader_window.activateWindow()
+                return
+            except RuntimeError:
+                self._reader_window = None
+
+        self._reader_window = EPUBReaderWindow(
+            book, self.paragraphs, selected_para,
+            dark_mode=self._preview_dark_mode,
+            parent=None,
+        )
+        self._reader_window.closed.connect(self._on_reader_closed)
+        self._reader_window.show()
+
+    def _on_reader_closed(self):
+        self._reader_window = None
+
+    def _refresh_reader_if_open(self, book, selected_para):
+        if self._reader_window is None:
+            return
+        try:
+            self._reader_window.refresh_chapter(book, self.paragraphs, selected_para)
+        except RuntimeError:
+            self._reader_window = None
+
+    def _mark_alignment_confirmed(self):
+        """Set alignment_force_correct on the current paragraph (🟢)."""
+        current_item = self.list_widget.currentItem()
+        if not current_item:
+            return
+        idx = current_item.data(Qt.ItemDataRole.UserRole)
+        if idx is None:
+            return
+        self.paragraphs[idx]['alignment_force_correct'] = True
+        self.paragraphs[idx].pop('alignment_force_bad', None)
+        self._update_item_visuals(idx)
+
+    def _flag_alignment_bad(self):
+        """Set alignment_force_bad on the current paragraph (🔴)."""
+        current_item = self.list_widget.currentItem()
+        if not current_item:
+            return
+        idx = current_item.data(Qt.ItemDataRole.UserRole)
+        if idx is None:
+            return
+        self.paragraphs[idx]['alignment_force_bad'] = True
+        self.paragraphs[idx].pop('alignment_force_correct', None)
+        self._update_item_visuals(idx)
 
     def on_retry_progress(self, idx: int, attempt: int, max_attempts: int, temperature: float):
         self.current_retry_attempt = attempt
@@ -3039,6 +4614,20 @@ class TranslatorApp(QMainWindow):
     def _get_list_row_for_para_index(self, para_index):
         return self.para_to_row_map.get(para_index, None)
 
+    def _update_translation_field_state(self, para: dict) -> None:
+        """Update the Translation tab label and editability based on alignment state."""
+        is_aligned = bool(
+            self.file_type == 'epub'
+            and para.get('processing_mode') == 'legacy'
+            and para.get('aligned_translated_html')
+        )
+        if is_aligned:
+            self.trans_lbl.setText("TRANSLATION  (EDITABLE IN ALIGNMENT TAB)")
+            self.translated_text_view.setReadOnly(True)
+        else:
+            self.trans_lbl.setText("TRANSLATION  (EDITABLE)")
+            self.translated_text_view.setReadOnly(False)
+
     def display_selected_fragment(self, current_item, previous_item):
         if not current_item:
             return
@@ -3061,6 +4650,12 @@ class TranslatorApp(QMainWindow):
 
         self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
 
+        self._update_alignment_tab(idx)
+        self._update_translation_field_state(self.paragraphs[idx])
+
+        if hasattr(self, 'panel_tabs') and self.panel_tabs.currentIndex() == 2:
+            self.refresh_preview()
+
     def _refresh_current_fragment_display(self):
         current_item = self.list_widget.currentItem()
         if not current_item:
@@ -3077,6 +4672,11 @@ class TranslatorApp(QMainWindow):
             self._format_text_for_display(self.paragraphs[idx]['translated_text'])
         )
         self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
+        self._update_alignment_tab(idx)
+        self._update_translation_field_state(self.paragraphs[idx])
+
+        if hasattr(self, 'panel_tabs') and self.panel_tabs.currentIndex() == 2:
+            self.refresh_preview()
 
     def update_translation_from_edit(self):
         current_item = self.list_widget.currentItem()
@@ -3094,6 +4694,12 @@ class TranslatorApp(QMainWindow):
 
         self.paragraphs[idx]['translated_text'] = edited_text
         self.paragraphs[idx]['is_translated'] = is_now_translated
+
+        if was_translated and is_now_translated:
+            if self.paragraphs[idx].get('aligned_translated_html'):
+                self.paragraphs[idx].pop('aligned_translated_html', None)
+                self.paragraphs[idx].pop('alignment_corrections', None)
+                self.paragraphs[idx].pop('alignment_uncertain', None)
 
         self._update_item_visuals(idx)
 
@@ -3130,7 +4736,32 @@ class TranslatorApp(QMainWindow):
         if len(preview_text) > 70:
             preview_text = preview_text[:67] + '...'
 
-        item.setText(f"[{number}] {preview_text}")
+        alignment_dot = ''
+        if (self.file_type == 'epub'
+                and para.get('processing_mode') == 'legacy'
+                and para.get('is_translated')):
+            original_html = para.get('original_html', '')
+            has_inline_tags = any(
+                f'<{tag}' in original_html or f'<{tag}>' in original_html
+                for tag in INLINE_TRANSFER_TAGS
+            )
+            if para.get('alignment_force_correct'):
+                alignment_dot = '🟢 '
+            elif para.get('alignment_force_bad'):
+                alignment_dot = '🔴 '
+            elif not has_inline_tags:
+                alignment_dot = '⚫ '
+            elif para.get('aligned_translated_html'):
+                if para.get('alignment_auto_wrap'):
+                    alignment_dot = '🟢 '
+                else:
+                    corrections = para.get('alignment_corrections', 0)
+                    if corrections >= 2:
+                        alignment_dot = '🟠 '
+                    else:
+                        alignment_dot = '🟡 '
+
+        item.setText(f"[{number}] {alignment_dot}{preview_text}")
 
         if self.mismatch_checker:
             has_mismatch, flags = self.mismatch_checker.check_mismatch(para)
@@ -3422,9 +5053,31 @@ class TranslatorApp(QMainWindow):
         if not is_forced:
             lines.append("<i style='color: #888;'>Tip: Use 'Mark as Correct' to ignore, or 'Unmark' to flag manually</i>")
 
+        align_flag = flags.get("alignment_uncertain")
+        if align_flag and isinstance(align_flag, dict):
+            lines.append("")
+            lines.append("<u>⚠ Alignment Uncertainty (Legacy mode):</u>")
+            count   = align_flag.get("count", 0)
+            detail  = align_flag.get("detail", [])
+            lines.append(
+                f"• Heuristics had to correct tag positions <b>{count}×</b> "
+                f"in this paragraph — inline tags may be misplaced."
+            )
+            if detail:
+                lines.append("  &nbsp;&nbsp;<i>Corrections applied:</i>")
+                for d in detail[:4]:
+                    lines.append(f"  &nbsp;&nbsp;– {d}")
+                if len(detail) > 4:
+                    lines.append(f"  &nbsp;&nbsp;... (+{len(detail) - 4} more)")
+            lines.append(
+                "  &nbsp;&nbsp;<i>Verify bold/italic/span placement in the output.</i>"
+            )
+
         return "<br>".join(lines)
 
     def _update_status_after_file_load(self):
+        self._update_alignment_button_visibility()
+
         if self.file_type == "txt":
             self.statusBar().showMessage("📄 TXT file loaded - ready to translate", 5000)
             return
@@ -3494,8 +5147,9 @@ class TranslatorApp(QMainWindow):
                 name, ext = os.path.splitext(filename)
                 filename = name[:60] + "…" + ext
 
-            translated_count = sum(1 for p in self.paragraphs if p.get('is_translated', False))
-            total_count = len(self.paragraphs)
+            translatable = [p for p in self.paragraphs if not p.get('is_non_translatable', False)]
+            translated_count = sum(1 for p in translatable if p.get('is_translated', False))
+            total_count = len(translatable)
 
             self.file_label.setText(f"{icon} {filename}  •  {translated_count}/{total_count}")
 
@@ -3551,6 +5205,19 @@ class TranslatorApp(QMainWindow):
         percent = int(self.completed_translations / self.total_to_translate * 100)
         self.progress_bar.setValue(percent)
 
+    def _update_context_visibility(self):
+        batch_on = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
+        json_on = hasattr(self, 'json_payload_checkbox') and self.json_payload_checkbox.isChecked()
+        hide = batch_on or json_on
+        for widget in [
+            getattr(self, '_lbl_context_before', None),
+            getattr(self, 'context_before_spinbox', None),
+            getattr(self, '_lbl_context_after', None),
+            getattr(self, 'context_after_spinbox', None),
+        ]:
+            if widget is not None:
+                widget.setVisible(not hide)
+
     def _show_ps_in_ui(self) -> bool:
         if not hasattr(self, 'inline_formatting_checkbox'):
             return False
@@ -3572,6 +5239,52 @@ class TranslatorApp(QMainWindow):
             return text
 
         return text.replace('<ps>', '\n')
+
+    def _filter_alignment_dot(self, dot: Optional[str]):
+        """Filter list to show only fragments with the given alignment dot colour.
+        dot values: '🟢','🟡','🟠','⚫','🔴','none', or None (show all).
+        Note: alignment_force_correct also maps to '🟢'.
+        """
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            idx = item.data(Qt.ItemDataRole.UserRole)
+            para = self.paragraphs[idx]
+
+            if dot is None:
+                item.setHidden(False)
+                continue
+
+            original_html = para.get('original_html', '')
+            has_inline_tags = any(
+                f'<{tag}' in original_html or f'<{tag}>' in original_html
+                for tag in INLINE_TRANSFER_TAGS
+            )
+            is_translated = para.get('is_translated', False)
+            is_legacy_epub = (
+                self.file_type == 'epub'
+                and para.get('processing_mode') == 'legacy'
+            )
+
+            if not is_legacy_epub or not is_translated:
+                item.setHidden(True)
+                continue
+
+            if para.get('alignment_force_correct'):
+                current_dot = '🟢'
+            elif para.get('alignment_force_bad'):
+                current_dot = '🔴'
+            elif not has_inline_tags:
+                current_dot = '⚫'
+            elif para.get('aligned_translated_html'):
+                if para.get('alignment_auto_wrap'):
+                    current_dot = '🟢'
+                else:
+                    corrections = para.get('alignment_corrections', 0)
+                    current_dot = '🟠' if corrections >= 2 else '🟡'
+            else:
+                current_dot = 'none'
+
+            item.setHidden(current_dot != dot)
 
     def filter_list(self, show_translated):
         for i in range(self.list_widget.count()):
@@ -3838,8 +5551,8 @@ class TranslatorApp(QMainWindow):
                 checked_indices.append(idx)
 
         service = self.quick_translate_service_combo.currentText()
-        source_lang = self.source_lang_combo.currentText().strip().lower()
-        target_lang = self.target_lang_combo.currentText().strip().lower()
+        source_lang = (self.source_lang_combo.currentData(Qt.ItemDataRole.UserRole) or "").strip().lower()
+        target_lang = (self.target_lang_combo.currentData(Qt.ItemDataRole.UserRole) or "").strip().lower()
 
         if not target_lang:
             self.show_message("Missing Target Language", "Please select a target language.", QMessageBox.Icon.Warning)
@@ -3931,6 +5644,9 @@ class TranslatorApp(QMainWindow):
 
         self.paragraphs[idx]['translated_text'] = translated_text
         self.paragraphs[idx]['is_translated'] = True
+        self.paragraphs[idx].pop('aligned_translated_html', None)
+        self.paragraphs[idx].pop('alignment_corrections', None)
+        self.paragraphs[idx].pop('alignment_uncertain', None)
         self._update_item_visuals(idx)
 
         row = self.para_to_row_map.get(idx)
@@ -3948,6 +5664,7 @@ class TranslatorApp(QMainWindow):
                 self._format_text_for_display(translated_text)
             )
             self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
+            self._update_alignment_tab(idx)
 
         self.statusBar().showMessage(f"[{service}] Fragment #{idx + 1} translated.", 3000)
 
@@ -4199,154 +5916,217 @@ class TranslatorApp(QMainWindow):
 
     def update_llm_editor_content(self):
         for i in reversed(range(self.llm_editor_layout.count())):
-            widget = self.llm_editor_layout.itemAt(i).widget()
-            if widget:
-                widget.deleteLater()
+            item = self.llm_editor_layout.itemAt(i)
+            if item and item.widget():
+                item.widget().deleteLater()
 
         has_file = bool(self.original_file_path)
+
+        self.single_prompt_checkbox.setVisible(has_file and not self.json_payload_checkbox.isChecked())
+        self.json_payload_checkbox.setVisible(has_file)
+        is_json = self.json_payload_checkbox.isChecked()
+        self.json_response_field_label.setVisible(has_file and is_json)
+        self.json_response_field_edit.setVisible(has_file and is_json)
 
         if not has_file:
             label = QLabel("Load a file first to edit LLM prompts")
             label.setStyleSheet("color: #888; padding: 20px;")
             self.llm_editor_layout.addWidget(label)
-
             for attr in ('ollama_prompt_edit', 'system_prompt_edit',
-                         'assistant_prompt_edit', 'user_prompt_edit', 'json_payload_edit'):
+                         'assistant_prompt_edit', 'user_prompt_edit',
+                         'json_payload_edit', 'batch_hint_edit'):
                 if hasattr(self, attr):
                     delattr(self, attr)
             return
 
+        batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
+
+        outer_splitter = QSplitter(Qt.Orientation.Vertical)
+
         if self.json_payload_checkbox.isChecked():
-            info_label = QLabel("JSON Payload Template  —  available variables: {core_text}  {context_before}  {context_after}")
+            main_widget = QWidget()
+            main_layout = QVBoxLayout(main_widget)
+            main_layout.setContentsMargins(0, 0, 0, 0)
+            main_layout.setSpacing(4)
+
+            if batch_mode:
+                info_label = QLabel("JSON Payload Template (Batch mode)  —  available variable: {core_text}  (context disabled in batch)")
+            else:
+                info_label = QLabel("JSON Payload Template  —  available variables: {core_text}  {context_before}  {context_after}")
             info_label.setStyleSheet("font-weight: bold; color: #cc8800;")
-            self.llm_editor_layout.addWidget(info_label)
+            main_layout.addWidget(info_label)
 
             self.json_payload_edit = QTextEdit()
-            self.json_payload_edit.setMinimumHeight(400)
-
             variant = self._get_current_variant()
             cached_template = ""
-
             if variant and variant in self.current_prompts_cache:
-                cached_template = self.current_prompts_cache[variant].get('json_payload', '')
+                cache_key = 'batch_json_payload' if batch_mode else 'json_payload'
+                cached_template = self.current_prompts_cache[variant].get(cache_key, '')
             elif variant:
                 loaded = self.prompt_manager.load_prompts_for_variant(variant)
-                cached_template = loaded.get('json_payload', '')
-
+                cache_key = 'batch_json_payload' if batch_mode else 'json_payload'
+                cached_template = loaded.get(cache_key, '')
             if not cached_template:
-                cached_template = getattr(self, '_json_payload_content', '')
-
+                if batch_mode:
+                    cached_template = self.prompt_manager.get_default_batch_json_payload_prompt(variant or '')
+                else:
+                    cached_template = getattr(self, '_json_payload_content', '')
             if cached_template:
                 self.json_payload_edit.setPlainText(cached_template)
             else:
                 self.json_payload_edit.setPlainText(
                     self.prompt_manager.get_default_json_payload_prompt(variant or '')
                 )
-
             cached_response_field = self.app_settings.get('json_response_field', '')
             if cached_response_field:
                 self.json_response_field_edit.setText(cached_response_field)
-
             try:
                 self.json_payload_edit.textChanged.disconnect()
             except:
                 pass
-
             self.json_payload_edit.textChanged.connect(self.on_json_payload_content_changed)
-            self.llm_editor_layout.addWidget(self.json_payload_edit)
+            main_layout.addWidget(self.json_payload_edit)
 
             for attr in ('ollama_prompt_edit', 'system_prompt_edit',
                          'assistant_prompt_edit', 'user_prompt_edit'):
                 if hasattr(self, attr):
                     delattr(self, attr)
-            return
 
-        variant = self._get_current_variant()
-        prompts = self._get_current_prompts_from_cache(variant)
-
-        llm_choice = self.app_settings.get("llm_choice", "LM Studio")
-
-        if llm_choice == "Ollama":
-            label = QLabel("Full Ollama Prompt (system + context + user):")
-            label.setStyleSheet("font-weight: bold; color: #0066cc;")
-            self.llm_editor_layout.addWidget(label)
-
-            self.ollama_prompt_edit = QTextEdit()
-            self.ollama_prompt_edit.setMinimumHeight(400)
-            self.ollama_prompt_edit.setPlainText(prompts['ollama'])
-
-            try:
-                self.ollama_prompt_edit.textChanged.disconnect()
-            except:
-                pass
-
-            self.ollama_prompt_edit.textChanged.connect(self.on_ollama_prompt_changed)
-            self.llm_editor_layout.addWidget(self.ollama_prompt_edit)
-
-            for attr in ('system_prompt_edit', 'assistant_prompt_edit',
-                         'user_prompt_edit', 'json_payload_edit'):
-                if hasattr(self, attr):
-                    delattr(self, attr)
+            outer_splitter.addWidget(main_widget)
 
         else:
-            splitter = QSplitter(Qt.Orientation.Horizontal)
+            variant = self._get_current_variant()
+            prompts = self._get_current_prompts_from_cache(variant)
+            llm_choice = self.app_settings.get("llm_choice", "LM Studio")
 
-            system_container = QWidget()
-            system_layout = QVBoxLayout(system_container)
-            system_layout.setContentsMargins(0, 0, 0, 0)
-            system_label = QLabel("System Prompt:")
-            system_label.setStyleSheet("font-weight: bold; color: #0066cc;")
-            system_layout.addWidget(system_label)
-            self.system_prompt_edit = QTextEdit()
-            self.system_prompt_edit.setMinimumHeight(400)
-            self.system_prompt_edit.setPlainText(prompts['system'])
+            if llm_choice == "Ollama":
+                main_widget = QWidget()
+                main_layout = QVBoxLayout(main_widget)
+                main_layout.setContentsMargins(0, 0, 0, 0)
+                main_layout.setSpacing(4)
+
+                label = QLabel("Full Ollama Prompt (system + context + user):")
+                label.setStyleSheet("font-weight: bold; color: #0066cc;")
+                main_layout.addWidget(label)
+
+                self.ollama_prompt_edit = QTextEdit()
+                self.ollama_prompt_edit.setPlainText(prompts['ollama'])
+                try:
+                    self.ollama_prompt_edit.textChanged.disconnect()
+                except:
+                    pass
+                self.ollama_prompt_edit.textChanged.connect(self.on_ollama_prompt_changed)
+                main_layout.addWidget(self.ollama_prompt_edit)
+
+                for attr in ('system_prompt_edit', 'assistant_prompt_edit',
+                             'user_prompt_edit', 'json_payload_edit'):
+                    if hasattr(self, attr):
+                        delattr(self, attr)
+
+                outer_splitter.addWidget(main_widget)
+
+            else:
+                horiz_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+                system_container = QWidget()
+                system_layout = QVBoxLayout(system_container)
+                system_layout.setContentsMargins(0, 0, 0, 0)
+                system_label = QLabel("System Prompt:")
+                system_label.setStyleSheet("font-weight: bold; color: #0066cc;")
+                system_layout.addWidget(system_label)
+                self.system_prompt_edit = QTextEdit()
+                self.system_prompt_edit.setPlainText(prompts['system'])
+                try:
+                    self.system_prompt_edit.textChanged.disconnect()
+                except:
+                    pass
+                self.system_prompt_edit.textChanged.connect(self.on_system_prompt_changed)
+                system_layout.addWidget(self.system_prompt_edit)
+                horiz_splitter.addWidget(system_container)
+
+                assistant_container = QWidget()
+                assistant_layout = QVBoxLayout(assistant_container)
+                assistant_layout.setContentsMargins(0, 0, 0, 0)
+                assistant_label = QLabel("Assistant Instruction / Context:")
+                assistant_label.setStyleSheet("font-weight: bold; color: #009900;")
+                assistant_layout.addWidget(assistant_label)
+                self.assistant_prompt_edit = QTextEdit()
+                asst_key = 'batch_assistant' if batch_mode else 'assistant'
+                self.assistant_prompt_edit.setPlainText(prompts.get(asst_key, ''))
+                try:
+                    self.assistant_prompt_edit.textChanged.disconnect()
+                except:
+                    pass
+                self.assistant_prompt_edit.textChanged.connect(self.on_assistant_prompt_changed)
+                assistant_layout.addWidget(self.assistant_prompt_edit)
+                horiz_splitter.addWidget(assistant_container)
+
+                user_container = QWidget()
+                user_layout = QVBoxLayout(user_container)
+                user_layout.setContentsMargins(0, 0, 0, 0)
+                user_label = QLabel("User Prompt:")
+                user_label.setStyleSheet("font-weight: bold; color: #cc6600;")
+                user_layout.addWidget(user_label)
+                self.user_prompt_edit = QTextEdit()
+                self.user_prompt_edit.setPlainText(prompts['user'])
+                try:
+                    self.user_prompt_edit.textChanged.disconnect()
+                except:
+                    pass
+                self.user_prompt_edit.textChanged.connect(self.on_user_prompt_changed)
+                user_layout.addWidget(self.user_prompt_edit)
+                horiz_splitter.addWidget(user_container)
+
+                for attr in ('ollama_prompt_edit', 'json_payload_edit'):
+                    if hasattr(self, attr):
+                        delattr(self, attr)
+
+                outer_splitter.addWidget(horiz_splitter)
+
+        if batch_mode:
+            batch_widget = QWidget()
+            batch_layout = QVBoxLayout(batch_widget)
+            batch_layout.setContentsMargins(0, 4, 0, 0)
+            batch_layout.setSpacing(4)
+
+            lbl = QLabel(
+                "Batch Hint  —  appended to prompt when Sentence batching is ON  "
+                "(variables: {n} = segment count, {marker_count} = n−1):"
+            )
+            lbl.setStyleSheet("font-weight: bold; color: #aa44cc;")
+            batch_layout.addWidget(lbl)
+
+            self.batch_hint_edit = QTextEdit()
+            variant = self._get_current_variant()
+            cached = ""
+            if variant and variant in self.current_prompts_cache:
+                cached = self.current_prompts_cache[variant].get('batch_hint', '')
+            if not cached:
+                cached = self.prompt_manager.get_default_batch_hint_prompt()
+            self.batch_hint_edit.setPlainText(cached)
             try:
-                self.system_prompt_edit.textChanged.disconnect()
+                self.batch_hint_edit.textChanged.disconnect()
             except:
                 pass
-            self.system_prompt_edit.textChanged.connect(self.on_system_prompt_changed)
-            system_layout.addWidget(self.system_prompt_edit)
-            splitter.addWidget(system_container)
+            self.batch_hint_edit.textChanged.connect(self.on_batch_hint_changed)
+            batch_layout.addWidget(self.batch_hint_edit)
 
-            assistant_container = QWidget()
-            assistant_layout = QVBoxLayout(assistant_container)
-            assistant_layout.setContentsMargins(0, 0, 0, 0)
-            assistant_label = QLabel("Assistant Instruction / Context:")
-            assistant_label.setStyleSheet("font-weight: bold; color: #009900;")
-            assistant_layout.addWidget(assistant_label)
-            self.assistant_prompt_edit = QTextEdit()
-            self.assistant_prompt_edit.setMinimumHeight(400)
-            self.assistant_prompt_edit.setPlainText(prompts['assistant'])
-            try:
-                self.assistant_prompt_edit.textChanged.disconnect()
-            except:
-                pass
-            self.assistant_prompt_edit.textChanged.connect(self.on_assistant_prompt_changed)
-            assistant_layout.addWidget(self.assistant_prompt_edit)
-            splitter.addWidget(assistant_container)
+            outer_splitter.addWidget(batch_widget)
+            outer_splitter.setSizes([300, 160])
+        elif hasattr(self, 'batch_hint_edit'):
+            delattr(self, 'batch_hint_edit')
 
-            user_container = QWidget()
-            user_layout = QVBoxLayout(user_container)
-            user_layout.setContentsMargins(0, 0, 0, 0)
-            user_label = QLabel("User Prompt:")
-            user_label.setStyleSheet("font-weight: bold; color: #cc6600;")
-            user_layout.addWidget(user_label)
-            self.user_prompt_edit = QTextEdit()
-            self.user_prompt_edit.setMinimumHeight(400)
-            self.user_prompt_edit.setPlainText(prompts['user'])
-            try:
-                self.user_prompt_edit.textChanged.disconnect()
-            except:
-                pass
-            self.user_prompt_edit.textChanged.connect(self.on_user_prompt_changed)
-            user_layout.addWidget(self.user_prompt_edit)
-            splitter.addWidget(user_container)
+        self.llm_editor_layout.addWidget(outer_splitter)
 
-            self.llm_editor_layout.addWidget(splitter)
-
-            for attr in ('ollama_prompt_edit', 'json_payload_edit'):
-                if hasattr(self, attr):
-                    delattr(self, attr)
+    def on_batch_hint_changed(self):
+        if not hasattr(self, 'batch_hint_edit'):
+            return
+        variant = self._get_current_variant()
+        if not variant:
+            return
+        if variant not in self.current_prompts_cache:
+            self.current_prompts_cache[variant] = {}
+        self.current_prompts_cache[variant]['batch_hint'] = self.batch_hint_edit.toPlainText()
 
     def on_ollama_prompt_changed(self):
         if not hasattr(self, 'ollama_prompt_edit'):
@@ -4389,9 +6169,11 @@ class TranslatorApp(QMainWindow):
         if variant not in self.current_prompts_cache:
             self.current_prompts_cache[variant] = {}
 
-        self.current_prompts_cache[variant]['assistant'] = self.assistant_prompt_edit.toPlainText()
+        batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
+        cache_key = 'batch_assistant' if batch_mode else 'assistant'
+        self.current_prompts_cache[variant][cache_key] = self.assistant_prompt_edit.toPlainText()
 
-        logger.debug(f"Assistant prompt updated in cache (variant: {variant})")
+        logger.debug(f"Assistant prompt updated in cache (variant: {variant}, key: {cache_key})")
 
     def on_user_prompt_changed(self):
         if not hasattr(self, 'user_prompt_edit'):
@@ -4412,14 +6194,32 @@ class TranslatorApp(QMainWindow):
         is_json = bool(state)
         self.json_response_field_label.setVisible(is_json)
         self.json_response_field_edit.setVisible(is_json)
+        if is_json:
+            self.single_prompt_checkbox.setVisible(False)
+        else:
+            has_file = bool(self.original_file_path)
+            self.single_prompt_checkbox.setVisible(has_file)
         if self.llm_editor_container.isVisible():
             self.update_llm_editor_content()
+        self._update_context_visibility()
 
     def on_json_payload_content_changed(self):
         if not hasattr(self, 'json_payload_edit'):
             return
-        self._json_payload_content = self.json_payload_edit.toPlainText()
-        logger.debug("JSON payload template updated in memory")
+        batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
+        variant = self._get_current_variant()
+        if batch_mode:
+            if variant:
+                if variant not in self.current_prompts_cache:
+                    self.current_prompts_cache[variant] = {}
+                self.current_prompts_cache[variant]['batch_json_payload'] = self.json_payload_edit.toPlainText()
+        else:
+            self._json_payload_content = self.json_payload_edit.toPlainText()
+            if variant:
+                if variant not in self.current_prompts_cache:
+                    self.current_prompts_cache[variant] = {}
+                self.current_prompts_cache[variant]['json_payload'] = self.json_payload_edit.toPlainText()
+        logger.debug(f"JSON payload template updated in memory (batch={batch_mode})")
 
     def save_llm_instruction(self):
         variant = self._get_current_variant()
@@ -4435,16 +6235,27 @@ class TranslatorApp(QMainWindow):
 
                 template = self.json_payload_edit.toPlainText().strip()
                 response_field = self.json_response_field_edit.text().strip()
+                batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
 
-                self.prompt_manager.save_prompt(variant, 'json_payload', template)
-
-                if variant not in self.current_prompts_cache:
-                    self.current_prompts_cache[variant] = {}
-                self.current_prompts_cache[variant]['json_payload'] = template
-                self._json_payload_content = template
+                if batch_mode:
+                    self.prompt_manager.save_prompt(variant, 'batch_json_payload', template)
+                    if variant not in self.current_prompts_cache:
+                        self.current_prompts_cache[variant] = {}
+                    self.current_prompts_cache[variant]['batch_json_payload'] = template
+                else:
+                    self.prompt_manager.save_prompt(variant, 'json_payload', template)
+                    if variant not in self.current_prompts_cache:
+                        self.current_prompts_cache[variant] = {}
+                    self.current_prompts_cache[variant]['json_payload'] = template
+                    self._json_payload_content = template
 
                 self.app_settings['json_response_field'] = response_field
                 AppSettingsManager.save_settings(self.app_settings)
+
+                if hasattr(self, 'batch_hint_edit'):
+                    bh = self.batch_hint_edit.toPlainText().strip()
+                    self.prompt_manager.save_prompt(variant, 'batch_hint', bh)
+                    self.current_prompts_cache[variant]['batch_hint'] = bh
 
                 logger.info(f"Saved JSON payload template to file and response_field to settings: {variant}")
                 self.show_message("Success", f"JSON payload template saved for: {variant}")
@@ -4456,6 +6267,7 @@ class TranslatorApp(QMainWindow):
 
             prompts = self.current_prompts_cache[variant]
             llm_choice = self.app_settings.get("llm_choice", "LM Studio")
+            batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
 
             if llm_choice == "Ollama":
                 if 'ollama' in prompts:
@@ -4464,12 +6276,21 @@ class TranslatorApp(QMainWindow):
             else:
                 if 'system' in prompts:
                     self.prompt_manager.save_prompt(variant, 'system', prompts['system'])
-                if 'assistant' in prompts:
-                    self.prompt_manager.save_prompt(variant, 'assistant', prompts['assistant'])
+                if batch_mode:
+                    if 'batch_assistant' in prompts:
+                        self.prompt_manager.save_prompt(variant, 'batch_assistant', prompts['batch_assistant'])
+                else:
+                    if 'assistant' in prompts:
+                        self.prompt_manager.save_prompt(variant, 'assistant', prompts['assistant'])
                 if 'user' in prompts:
                     self.prompt_manager.save_prompt(variant, 'user', prompts['user'])
 
                 logger.info(f"Saved all prompts to files: {variant}")
+
+            if hasattr(self, 'batch_hint_edit'):
+                bh = self.batch_hint_edit.toPlainText().strip()
+                self.prompt_manager.save_prompt(variant, 'batch_hint', bh)
+                self.current_prompts_cache[variant]['batch_hint'] = bh
 
             self.show_message("Success", f"LLM instructions saved to disk for: {variant}")
 
@@ -4501,9 +6322,12 @@ class TranslatorApp(QMainWindow):
             self.current_prompts_cache[variant] = {
                 'system': self.prompt_manager.get_default_system_prompt(variant),
                 'assistant': self.prompt_manager.get_default_assistant_prompt(variant),
+                'batch_assistant': '',
                 'user': self.prompt_manager.get_default_user_prompt(variant),
                 'ollama': self.prompt_manager.get_default_ollama_prompt(variant),
                 'json_payload': '',
+                'batch_json_payload': self.prompt_manager.get_default_batch_json_payload_prompt(variant),
+                'batch_hint': self.prompt_manager.get_default_batch_hint_prompt(),
             }
 
             self._json_payload_content = ''
@@ -4547,9 +6371,12 @@ class TranslatorApp(QMainWindow):
             self.current_prompts_cache[variant] = {
                 'system': self.prompt_manager.get_default_system_prompt(variant),
                 'assistant': self.prompt_manager.get_default_assistant_prompt(variant),
+                'batch_assistant': '',
                 'user': self.prompt_manager.get_default_user_prompt(variant),
                 'ollama': self.prompt_manager.get_default_ollama_prompt(variant),
                 'json_payload': '',
+                'batch_json_payload': self.prompt_manager.get_default_batch_json_payload_prompt(variant),
+                'batch_hint': self.prompt_manager.get_default_batch_hint_prompt(),
             }
 
             self._json_payload_content = ''
@@ -4793,6 +6620,7 @@ class TranslatorApp(QMainWindow):
             self.inline_formatting_checkbox.setChecked(loaded_mode == 'inline')
             self.inline_formatting_checkbox.blockSignals(False)
             self.app_settings['use_inline_formatting'] = (loaded_mode == 'inline')
+            self.alignment_section_widget.setVisible(loaded_mode != 'inline')
             if self.llm_editor_container.isVisible():
                 self.update_llm_editor_content()
             return
@@ -4832,6 +6660,7 @@ class TranslatorApp(QMainWindow):
         self.paragraphs = []
         self.translation_queue = []
         self.current_translation_idx = None
+        self._preview_show_original_ids.clear()
 
         self.list_widget.clear()
         self.original_text_view.clear()
