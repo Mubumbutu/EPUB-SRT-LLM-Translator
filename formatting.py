@@ -1009,10 +1009,10 @@ class FormattingSynchronizer:
         text_stripped = text.strip()
         leading_ws  = text[:len(text) - len(text.lstrip())]
         trailing_ws = text[len(text.rstrip()):]
-
+    
         has_translation_open  = re.match(r'^<translation>', text_stripped, re.IGNORECASE)
         has_translation_close = re.search(r'</translation>$', text_stripped, re.IGNORECASE)
-
+    
         if has_translation_open and has_translation_close:
             text_without_tags = re.sub(
                 r'^<translation>\s*|\s*</translation>$',
@@ -1021,59 +1021,75 @@ class FormattingSynchronizer:
                 flags=re.IGNORECASE
             ).strip()
             return leading_ws + text_without_tags + trailing_ws
-
+    
+        KNOWN_INTERNAL_TAGS = re.compile(
+            r'^<(p_\d+|id_\d+|nt_\d+|ps|z)[\s/>]', re.IGNORECASE
+        )
+    
+        unknown_opening_tag = re.match(r'^<\s*([A-Za-z_][A-Za-z0-9_-]*)[^>]*>', text_stripped)
+        if unknown_opening_tag and not KNOWN_INTERNAL_TAGS.match(text_stripped):
+            closing_tag = re.compile(rf'<\/{re.escape(unknown_opening_tag.group(1))}>$')
+            if closing_tag.search(text_stripped):
+                text_without_tags = re.sub(
+                    rf'^<{re.escape(unknown_opening_tag.group(1))}>\s*|\s*</{re.escape(unknown_opening_tag.group(1))}>$',
+                    '',
+                    text_stripped,
+                    flags=re.IGNORECASE
+                ).strip()
+                return leading_ws + text_without_tags + trailing_ws
+    
         if '</text_to_translate>' in text_stripped:
             text_stripped = text_stripped.replace('</text_to_translate>', '')
             logger.debug("Removed rogue </text_to_translate> tag")
-
+    
         if re.search(r'</id_\d{2}>', text_stripped):
             text_stripped = re.sub(r'</id_\d{2}>', '', text_stripped).strip()
             logger.debug("Removed spurious </id_XX> closing tag(s)")
-
+    
         OPENING_TAGS = [
             '<translated>',
             '<TRANSLATED>',
             '<translation>',
             '<TRANSLATION>',
         ]
-
+    
         CLOSING_TAGS = [
             '</translated>',
             '</TRANSLATED>',
             '</translation>',
             '</TRANSLATION>',
         ]
-
+    
         has_opening_tag    = False
         opening_tag_length = 0
-
+    
         for tag in OPENING_TAGS:
             if text_stripped.startswith(tag):
                 has_opening_tag    = True
                 opening_tag_length = len(tag)
                 break
-
+    
         has_closing_tag    = False
         closing_tag_length = 0
-
+    
         for tag in CLOSING_TAGS:
             if text_stripped.endswith(tag):
                 has_closing_tag    = True
                 closing_tag_length = len(tag)
                 break
-
+    
         if has_opening_tag and has_closing_tag:
             text_without_tags = text_stripped[opening_tag_length:-closing_tag_length].strip()
             return leading_ws + text_without_tags + trailing_ws
-
+    
         if has_opening_tag and not has_closing_tag:
             text_without_opening = text_stripped[opening_tag_length:].strip()
             return leading_ws + text_without_opening + trailing_ws
-
+    
         if not has_opening_tag and has_closing_tag:
             text_without_closing = text_stripped[:-closing_tag_length].strip()
             return leading_ws + text_without_closing + trailing_ws
-
+    
         return leading_ws + text_stripped + trailing_ws
 
     def normalize_quotes(self, text: str) -> str:
@@ -1758,3 +1774,4 @@ class FormattingSynchronizer:
         cleaned = re.sub(r'  +', ' ', cleaned)
 
         return cleaned
+
