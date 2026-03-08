@@ -1023,7 +1023,7 @@ class FormattingSynchronizer:
             return leading_ws + text_without_tags + trailing_ws
     
         KNOWN_INTERNAL_TAGS = re.compile(
-            r'^<(p_\d+|id_\d+|nt_\d+|ps|z)[\s/>]', re.IGNORECASE
+            r'^<(p_\d+)[\s/>]', re.IGNORECASE
         )
     
         unknown_opening_tag = re.match(r'^<\s*([A-Za-z_][A-Za-z0-9_-]*)[^>]*>', text_stripped)
