@@ -25,14 +25,27 @@ class SessionManager:
         prompt_variant: str,
         json_payload_mode: bool = False,
         json_payload_template: str = "",
-        json_response_field: str = ""
+        json_response_field: str = "",
+        sentence_batch_enabled: bool = False,
+        sentence_batch_size: int = 5
     ) -> None:
+        _NON_SERIALISABLE = frozenset({
+            'auto_fix_history',
+        })
+
         paragraphs_to_save = []
         for para in paragraphs:
-            para_copy = para.copy()
-
-            if 'auto_fix_history' in para_copy:
-                del para_copy['auto_fix_history']
+            para_copy = {}
+            for k, v in para.items():
+                if k in _NON_SERIALISABLE:
+                    continue
+                try:
+                    from lxml import etree as _etree
+                    if isinstance(v, _etree._Element):
+                        continue
+                except Exception:
+                    pass
+                para_copy[k] = v
 
             para_copy['processing_mode'] = processing_mode
             paragraphs_to_save.append(para_copy)
@@ -54,6 +67,8 @@ class SessionManager:
             'json_payload_mode': json_payload_mode,
             'json_payload_template': json_payload_template,
             'json_response_field': json_response_field,
+            'sentence_batch_enabled': sentence_batch_enabled,
+            'sentence_batch_size': sentence_batch_size,
 
             'metadata': {
                 'processing_mode': processing_mode,
@@ -62,9 +77,19 @@ class SessionManager:
             }
         }
 
+        def _json_default(obj):
+            """Fallback serialiser: convert unknowns to their string repr."""
+            try:
+                from lxml import etree as _et
+                if isinstance(obj, _et._Element):
+                    return _et.tostring(obj, encoding='unicode')
+            except Exception:
+                pass
+            return str(obj)
+
         try:
             with open(path, 'w', encoding='utf-8') as f:
-                json.dump(session_data, f, ensure_ascii=False, indent=4)
+                json.dump(session_data, f, ensure_ascii=False, indent=4, default=_json_default)
             logger.info(f"Session saved to: {path}")
         except Exception as e:
             logger.error(f"Failed to save session: {e}")
@@ -121,12 +146,27 @@ class SessionManager:
                 'json_payload_mode': session_data.get('json_payload_mode', False),
                 'json_payload_template': session_data.get('json_payload_template', ''),
                 'json_response_field': session_data.get('json_response_field', ''),
+                'sentence_batch_enabled': session_data.get('sentence_batch_enabled', False),
+                'sentence_batch_size': session_data.get('sentence_batch_size', 5),
                 'metadata': {
                     'processing_mode': processing_mode,
                     'prompt_variant': prompt_variant,
                     'skip_inline_tags': skip_inline_tags
                 }
             }
+
+            _INT_KEY_FIELDS = ('inline_formatting_map', 'non_translatable_placeholders')
+            for para in result['paragraphs']:
+                for field in _INT_KEY_FIELDS:
+                    raw = para.get(field)
+                    if isinstance(raw, dict) and raw:
+                        converted = {}
+                        for k, v in raw.items():
+                            try:
+                                converted[int(k)] = v
+                            except (ValueError, TypeError):
+                                converted[k] = v
+                        para[field] = converted
 
             logger.info(f"Session loaded from: {session_path}")
             logger.info(f"Mode: {processing_mode}, Variant: {prompt_variant}, skip_inline_tags: {skip_inline_tags}")
@@ -215,7 +255,7 @@ class AppSettingsManager:
         },
         "alignment_settings": {
             "device":     "cpu",
-            "model_name": "xlm-roberta-base",
+            "model_name": "xlm-roberta-large",
         },
     }
 
@@ -396,6 +436,18 @@ class PromptManager:
         else:
             result['assistant'] = PromptManager.get_default_assistant_prompt(variant)
 
+        batch_assistant_file = f"llm_prompt_batch_assistant_{variant}.txt"
+        if os.path.exists(batch_assistant_file):
+            try:
+                with open(batch_assistant_file, 'r', encoding='utf-8') as f:
+                    result['batch_assistant'] = f.read().strip()
+                logger.info(f"Loaded custom batch assistant prompt: {batch_assistant_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load {batch_assistant_file}: {e}, using empty")
+                result['batch_assistant'] = ''
+        else:
+            result['batch_assistant'] = ''
+
         user_file = f"llm_prompt_user_{variant}.txt"
         if os.path.exists(user_file):
             try:
@@ -431,6 +483,30 @@ class PromptManager:
                 result['json_payload'] = PromptManager.get_default_json_payload_prompt(variant)
         else:
             result['json_payload'] = PromptManager.get_default_json_payload_prompt(variant)
+
+        batch_json_payload_file = f"llm_prompt_batch_json_payload_{variant}.txt"
+        if os.path.exists(batch_json_payload_file):
+            try:
+                with open(batch_json_payload_file, 'r', encoding='utf-8') as f:
+                    result['batch_json_payload'] = f.read().strip()
+                logger.info(f"Loaded batch JSON payload template: {batch_json_payload_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load {batch_json_payload_file}: {e}, using factory")
+                result['batch_json_payload'] = PromptManager.get_default_batch_json_payload_prompt(variant)
+        else:
+            result['batch_json_payload'] = PromptManager.get_default_batch_json_payload_prompt(variant)
+
+        batch_hint_file = f"llm_prompt_batch_hint_{variant}.txt"
+        if os.path.exists(batch_hint_file):
+            try:
+                with open(batch_hint_file, 'r', encoding='utf-8') as f:
+                    result['batch_hint'] = f.read().strip()
+                logger.info(f"Loaded batch hint template: {batch_hint_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load {batch_hint_file}: {e}, using factory")
+                result['batch_hint'] = PromptManager.get_default_batch_hint_prompt()
+        else:
+            result['batch_hint'] = PromptManager.get_default_batch_hint_prompt()
 
         return result
 
@@ -557,73 +633,121 @@ Return format:
     @staticmethod
     def get_default_json_payload_prompt(variant: str) -> str:
         base_instructions = (
-            "Translate the following text to Polish.\\n"
-            "Return ONLY valid JSON in this exact format: {\\\"translation\\\":\\\"...\\\"}\\n"
-            "Do not add any explanations, comments, markdown or extra text outside the JSON.\\n\\n"
+            "Translate the following text to Polish.\n"
+            'Return ONLY valid JSON in this exact format: {"translation":"..."}\n'
+            "Do not add any explanations, comments, markdown or extra text outside the JSON.\n\n"
         )
 
         if variant == "txt":
             variant_instructions = (
-                "Preserve natural paragraph breaks and text structure.\\n"
-                "Keep URLs, emails and proper nouns as-is.\\n"
-                "Maintain the author's meaning and natural Polish flow.\\n\\n"
+                "Preserve natural paragraph breaks and text structure.\n"
+                "Keep URLs, emails and proper nouns as-is.\n"
+                "Maintain the author's meaning and natural Polish flow.\n\n"
             )
-
         elif variant == "srt":
             variant_instructions = (
-                "LINE PRESERVATION: maintain line breaks (\\\\n) from the original.\\n"
-                "If the original has 2 lines, the translation must have exactly 2 lines.\\n"
-                "Keep dialogue dashes (- ) at line start if present in original.\\n"
-                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+                "LINE PRESERVATION: maintain line breaks (\\n) from the original.\n"
+                "If the original has 2 lines, the translation must have exactly 2 lines.\n"
+                "Keep dialogue dashes (- ) at line start if present in original.\n"
+                "Keep URLs, emails and proper nouns as-is.\n\n"
             )
-
         elif variant == "epub_legacy":
             variant_instructions = (
-                "RESERVE ELEMENTS — copy exactly, keep approximate position:\\n"
-                "  <id_00>, <id_01>, ... — images, <br> tags, non-translatable elements.\\n"
-                "Do NOT modify or remove them.\\n"
-                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+                "RESERVE ELEMENTS — copy exactly, keep approximate position:\n"
+                "  <id_00>, <id_01>, ... — images, <br> tags, non-translatable elements.\n"
+                "Do NOT modify or remove them.\n"
+                "Keep URLs, emails and proper nouns as-is.\n\n"
             )
-
         elif variant == "epub_inline":
             variant_instructions = (
-                "PLACEHOLDERS — copy all exactly and preserve their positions:\\n"
-                "  <id_00>, <id_01>... — images/<br>/structural (do NOT modify)\\n"
-                "  <p_00>...</p_00>... — inline formatting (<i>/<b>/etc.); every opening needs matching closing\\n"
-                "  <nt_00/>, <nt_01/>... — non-translatable anchors (self-closing, do NOT move)\\n"
-                "  <ps> — paragraph break; count in translation must match original EXACTLY\\n"
-                "NEVER use raw HTML tags like <i>, <b>, <em> — use only <p_XX> placeholders.\\n"
-                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+                "PLACEHOLDERS — copy all exactly and preserve their positions:\n"
+                "  <id_00>, <id_01>... — images/<br>/structural (do NOT modify)\n"
+                "  <p_00>...</p_00>... — inline formatting (<i>/<b>/etc.); every opening needs matching closing\n"
+                "  <nt_00/>, <nt_01/>... — non-translatable anchors (self-closing, do NOT move)\n"
+                "  <ps> — paragraph break; count in translation must match original EXACTLY\n"
+                "NEVER use raw HTML tags like <i>, <b>, <em> — use only <p_XX> placeholders.\n"
+                "Keep URLs, emails and proper nouns as-is.\n\n"
             )
-
         else:
             variant_instructions = ""
 
-        content = (
+        return (
             base_instructions
             + variant_instructions
-            + "Context before (for reference only, do NOT translate):\\n"
-            "{context_before}\\n\\n"
-            "Text to translate:\\n"
-            "{core_text}\\n\\n"
-            "Context after (for reference only, do NOT translate):\\n"
+            + "Context before (for reference only, do NOT translate):\n"
+            "{context_before}\n\n"
+            "Text to translate:\n"
+            "{core_text}\n\n"
+            "Context after (for reference only, do NOT translate):\n"
             "{context_after}"
-        )
-
-        return (
-            '{\n'
-            '    "messages": [\n'
-            '        {\n'
-            '            "role": "user",\n'
-            f'            "content": "{content}"\n'
-            '        }\n'
-            '    ]\n'
-            '}'
         )
 
     @staticmethod
     def get_default_json_response_field(variant: str) -> str:
         return ""
+
+    @staticmethod
+    def get_default_batch_json_payload_prompt(variant: str) -> str:
+        base_instructions = (
+            "Translate the following text segments to Polish.\n"
+            "The segments are separated by <z> markers.\n"
+            'Return ONLY valid JSON in this exact format: {"translation":"..."}\n'
+            "In the translation field, preserve ALL <z> markers in the same positions — "
+            "there must be exactly the same number of <z> markers as in the input.\n"
+            "Do not add any explanations, comments, markdown or extra text outside the JSON.\n\n"
+        )
+
+        if variant == "txt":
+            variant_instructions = (
+                "Preserve natural paragraph breaks and text structure.\n"
+                "Keep URLs, emails and proper nouns as-is.\n"
+                "Maintain the author's meaning and natural Polish flow.\n\n"
+            )
+        elif variant == "srt":
+            variant_instructions = (
+                "LINE PRESERVATION: maintain line breaks (\\n) from the original.\n"
+                "Keep dialogue dashes (- ) at line start if present in original.\n"
+                "Keep URLs, emails and proper nouns as-is.\n\n"
+            )
+        elif variant == "epub_legacy":
+            variant_instructions = (
+                "RESERVE ELEMENTS — copy exactly, keep approximate position:\n"
+                "  <id_00>, <id_01>, ... — images, <br> tags, non-translatable elements.\n"
+                "Do NOT modify or remove them.\n"
+                "Keep URLs, emails and proper nouns as-is.\n\n"
+            )
+        elif variant == "epub_inline":
+            variant_instructions = (
+                "PLACEHOLDERS — copy all exactly and preserve their positions:\n"
+                "  <id_00>, <id_01>... — images/<br>/structural (do NOT modify)\n"
+                "  <p_00>...</p_00>... — inline formatting (<i>/<b>/etc.); every opening needs matching closing\n"
+                "  <nt_00/>, <nt_01/>... — non-translatable anchors (self-closing, do NOT move)\n"
+                "  <ps> — paragraph break; count in translation must match original EXACTLY\n"
+                "NEVER use raw HTML tags like <i>, <b>, <em> — use only <p_XX> placeholders.\n"
+                "Keep URLs, emails and proper nouns as-is.\n\n"
+            )
+        else:
+            variant_instructions = ""
+
+        return (
+            base_instructions
+            + variant_instructions
+            + "Text segments to translate (separated by <z>):\n"
+            "{core_text}"
+        )
+    
+    @staticmethod
+    def get_default_batch_hint_prompt() -> str:
+        return (
+            "=== CRITICAL BATCH INSTRUCTION ===\n"
+            "The text below contains exactly {marker_count} separator marker(s) <z> dividing it into {n} separate paragraphs.\n"
+            "RULES — you MUST follow ALL of them:\n"
+            "1. Preserve every <z> marker exactly as-is — do NOT remove, add, move, or translate them.\n"
+            "2. Output EXACTLY {marker_count} <z> marker(s) in your translation — no more, no fewer.\n"
+            "3. The <z> marker is NOT an HTML tag — treat it as a literal paragraph boundary separator.\n"
+            "4. Translate each segment between <z> markers independently.\n"
+            "==================================="
+        )
 
     @staticmethod
     def save_prompts_for_variant(
@@ -675,9 +799,12 @@ Return format:
         files_to_delete = [
             f"llm_prompt_system_{variant}.txt",
             f"llm_prompt_assistant_{variant}.txt",
+            f"llm_prompt_batch_assistant_{variant}.txt",
             f"llm_prompt_user_{variant}.txt",
             f"llm_prompt_ollama_{variant}.txt",
             f"llm_prompt_json_payload_{variant}.txt",
+            f"llm_prompt_batch_json_payload_{variant}.txt",
+            f"llm_prompt_batch_hint_{variant}.txt",
         ]
 
         deleted_count = 0
@@ -745,73 +872,240 @@ class QuoteConstants:
     POLISH_CLOSING = '\u201d'
 
 class LanguageConstants:
+    # Format: (Display Name, language code)
+    # Codes follow Google Translate / DeepL conventions.
+    # Google Translate uses lowercase codes; DeepL uses uppercase.
+    # The combo stores the code as UserData; display shows the full name.
+
     SOURCE_LANGUAGES = [
-        ("Auto", None),
-        ("Bulgarian", "BG"),
-        ("Czech", "CS"),
-        ("Danish", "DA"),
-        ("German", "DE"),
-        ("Greek", "EL"),
-        ("English", "EN"),
-        ("Spanish", "ES"),
-        ("Estonian", "ET"),
-        ("Finnish", "FI"),
-        ("French", "FR"),
-        ("Hungarian", "HU"),
-        ("Indonesian", "ID"),
-        ("Italian", "IT"),
-        ("Japanese", "JA"),
-        ("Korean", "KO"),
-        ("Lithuanian", "LT"),
-        ("Latvian", "LV"),
-        ("Norwegian (Bokmål)", "NB"),
-        ("Dutch", "NL"),
-        ("Polish", "PL"),
-        ("Portuguese", "PT"),
-        ("Romanian", "RO"),
-        ("Russian", "RU"),
-        ("Slovak", "SK"),
-        ("Slovenian", "SL"),
-        ("Swedish", "SV"),
-        ("Turkish", "TR"),
-        ("Ukrainian", "UK"),
-        ("Chinese", "ZH"),
+        ("Auto Detect",                 "auto"),
+        # — European —
+        ("Albanian",                    "sq"),
+        ("Basque",                      "eu"),
+        ("Belarusian",                  "be"),
+        ("Bosnian",                     "bs"),
+        ("Bulgarian",                   "bg"),
+        ("Catalan",                     "ca"),
+        ("Croatian",                    "hr"),
+        ("Czech",                       "cs"),
+        ("Danish",                      "da"),
+        ("Dutch",                       "nl"),
+        ("English",                     "en"),
+        ("Estonian",                    "et"),
+        ("Finnish",                     "fi"),
+        ("French",                      "fr"),
+        ("Galician",                    "gl"),
+        ("German",                      "de"),
+        ("Greek",                       "el"),
+        ("Hungarian",                   "hu"),
+        ("Icelandic",                   "is"),
+        ("Irish",                       "ga"),
+        ("Italian",                     "it"),
+        ("Latvian",                     "lv"),
+        ("Lithuanian",                  "lt"),
+        ("Luxembourgish",               "lb"),
+        ("Macedonian",                  "mk"),
+        ("Maltese",                     "mt"),
+        ("Norwegian (Bokmål)",          "nb"),
+        ("Polish",                      "pl"),
+        ("Portuguese",                  "pt"),
+        ("Romanian",                    "ro"),
+        ("Russian",                     "ru"),
+        ("Serbian",                     "sr"),
+        ("Slovak",                      "sk"),
+        ("Slovenian",                   "sl"),
+        ("Spanish",                     "es"),
+        ("Swedish",                     "sv"),
+        ("Turkish",                     "tr"),
+        ("Ukrainian",                   "uk"),
+        ("Welsh",                       "cy"),
+        # — Middle East / Central Asia —
+        ("Arabic",                      "ar"),
+        ("Armenian",                    "hy"),
+        ("Azerbaijani",                 "az"),
+        ("Georgian",                    "ka"),
+        ("Hebrew",                      "he"),
+        ("Kazakh",                      "kk"),
+        ("Kurdish (Kurmanji)",          "ku"),
+        ("Kyrgyz",                      "ky"),
+        ("Persian (Farsi)",             "fa"),
+        ("Tajik",                       "tg"),
+        ("Turkmen",                     "tk"),
+        ("Uzbek",                       "uz"),
+        # — South / Southeast Asia —
+        ("Bengali",                     "bn"),
+        ("Burmese",                     "my"),
+        ("Filipino (Tagalog)",          "tl"),
+        ("Gujarati",                    "gu"),
+        ("Hindi",                       "hi"),
+        ("Indonesian",                  "id"),
+        ("Javanese",                    "jv"),
+        ("Kannada",                     "kn"),
+        ("Khmer",                       "km"),
+        ("Lao",                         "lo"),
+        ("Malay",                       "ms"),
+        ("Malayalam",                   "ml"),
+        ("Marathi",                     "mr"),
+        ("Nepali",                      "ne"),
+        ("Odia (Oriya)",                "or"),
+        ("Punjabi",                     "pa"),
+        ("Sinhala",                     "si"),
+        ("Tamil",                       "ta"),
+        ("Telugu",                      "te"),
+        ("Thai",                        "th"),
+        ("Urdu",                        "ur"),
+        ("Vietnamese",                  "vi"),
+        # — East Asia —
+        ("Chinese (Simplified)",        "zh-CN"),
+        ("Chinese (Traditional)",       "zh-TW"),
+        ("Japanese",                    "ja"),
+        ("Korean",                      "ko"),
+        ("Mongolian",                   "mn"),
+        # — Africa —
+        ("Afrikaans",                   "af"),
+        ("Amharic",                     "am"),
+        ("Hausa",                       "ha"),
+        ("Igbo",                        "ig"),
+        ("Malagasy",                    "mg"),
+        ("Sesotho",                     "st"),
+        ("Shona",                       "sn"),
+        ("Somali",                      "so"),
+        ("Swahili",                     "sw"),
+        ("Xhosa",                       "xh"),
+        ("Yoruba",                      "yo"),
+        ("Zulu",                        "zu"),
+        # — Americas / Other —
+        ("Cebuano",                     "ceb"),
+        ("Corsican",                    "co"),
+        ("Esperanto",                   "eo"),
+        ("Frisian",                     "fy"),
+        ("Hawaiian",                    "haw"),
+        ("Hmong",                       "hmn"),
+        ("Latin",                       "la"),
+        ("Maori",                       "mi"),
+        ("Samoan",                      "sm"),
+        ("Scots Gaelic",                "gd"),
+        ("Sindhi",                      "sd"),
+        ("Sundanese",                   "su"),
+        ("Uyghur",                      "ug"),
+        ("Yiddish",                     "yi"),
     ]
 
     TARGET_LANGUAGES = [
-        ("Bulgarian", "BG"),
-        ("Czech", "CS"),
-        ("Danish", "DA"),
-        ("German", "DE"),
-        ("Greek", "EL"),
-        ("English", "EN"),
-        ("English (British)", "EN-GB"),
-        ("English (American)", "EN-US"),
-        ("Spanish", "ES"),
-        ("Estonian", "ET"),
-        ("Finnish", "FI"),
-        ("French", "FR"),
-        ("Hungarian", "HU"),
-        ("Indonesian", "ID"),
-        ("Italian", "IT"),
-        ("Japanese", "JA"),
-        ("Korean", "KO"),
-        ("Lithuanian", "LT"),
-        ("Latvian", "LV"),
-        ("Norwegian (Bokmål)", "NB"),
-        ("Dutch", "NL"),
-        ("Polish", "PL"),
-        ("Portuguese", "PT"),
-        ("Portuguese (Portugal)", "PT-PT"),
-        ("Portuguese (Brazil)", "PT-BR"),
-        ("Romanian", "RO"),
-        ("Russian", "RU"),
-        ("Slovak", "SK"),
-        ("Slovenian", "SL"),
-        ("Swedish", "SV"),
-        ("Turkish", "TR"),
-        ("Ukrainian", "UK"),
-        ("Chinese", "ZH"),
+        # — European —
+        ("Albanian",                    "sq"),
+        ("Basque",                      "eu"),
+        ("Belarusian",                  "be"),
+        ("Bosnian",                     "bs"),
+        ("Bulgarian",                   "bg"),
+        ("Catalan",                     "ca"),
+        ("Croatian",                    "hr"),
+        ("Czech",                       "cs"),
+        ("Danish",                      "da"),
+        ("Dutch",                       "nl"),
+        ("English",                     "en"),
+        ("English (British)",           "en-GB"),
+        ("English (American)",          "en-US"),
+        ("Estonian",                    "et"),
+        ("Finnish",                     "fi"),
+        ("French",                      "fr"),
+        ("Galician",                    "gl"),
+        ("German",                      "de"),
+        ("Greek",                       "el"),
+        ("Hungarian",                   "hu"),
+        ("Icelandic",                   "is"),
+        ("Irish",                       "ga"),
+        ("Italian",                     "it"),
+        ("Latvian",                     "lv"),
+        ("Lithuanian",                  "lt"),
+        ("Luxembourgish",               "lb"),
+        ("Macedonian",                  "mk"),
+        ("Maltese",                     "mt"),
+        ("Norwegian (Bokmål)",          "nb"),
+        ("Polish",                      "pl"),
+        ("Portuguese",                  "pt"),
+        ("Portuguese (Portugal)",       "pt-PT"),
+        ("Portuguese (Brazil)",         "pt-BR"),
+        ("Romanian",                    "ro"),
+        ("Russian",                     "ru"),
+        ("Serbian",                     "sr"),
+        ("Slovak",                      "sk"),
+        ("Slovenian",                   "sl"),
+        ("Spanish",                     "es"),
+        ("Swedish",                     "sv"),
+        ("Turkish",                     "tr"),
+        ("Ukrainian",                   "uk"),
+        ("Welsh",                       "cy"),
+        # — Middle East / Central Asia —
+        ("Arabic",                      "ar"),
+        ("Armenian",                    "hy"),
+        ("Azerbaijani",                 "az"),
+        ("Georgian",                    "ka"),
+        ("Hebrew",                      "he"),
+        ("Kazakh",                      "kk"),
+        ("Kurdish (Kurmanji)",          "ku"),
+        ("Kyrgyz",                      "ky"),
+        ("Persian (Farsi)",             "fa"),
+        ("Tajik",                       "tg"),
+        ("Turkmen",                     "tk"),
+        ("Uzbek",                       "uz"),
+        # — South / Southeast Asia —
+        ("Bengali",                     "bn"),
+        ("Burmese",                     "my"),
+        ("Filipino (Tagalog)",          "tl"),
+        ("Gujarati",                    "gu"),
+        ("Hindi",                       "hi"),
+        ("Indonesian",                  "id"),
+        ("Javanese",                    "jv"),
+        ("Kannada",                     "kn"),
+        ("Khmer",                       "km"),
+        ("Lao",                         "lo"),
+        ("Malay",                       "ms"),
+        ("Malayalam",                   "ml"),
+        ("Marathi",                     "mr"),
+        ("Nepali",                      "ne"),
+        ("Odia (Oriya)",                "or"),
+        ("Punjabi",                     "pa"),
+        ("Sinhala",                     "si"),
+        ("Tamil",                       "ta"),
+        ("Telugu",                      "te"),
+        ("Thai",                        "th"),
+        ("Urdu",                        "ur"),
+        ("Vietnamese",                  "vi"),
+        # — East Asia —
+        ("Chinese (Simplified)",        "zh-CN"),
+        ("Chinese (Traditional)",       "zh-TW"),
+        ("Japanese",                    "ja"),
+        ("Korean",                      "ko"),
+        ("Mongolian",                   "mn"),
+        # — Africa —
+        ("Afrikaans",                   "af"),
+        ("Amharic",                     "am"),
+        ("Hausa",                       "ha"),
+        ("Igbo",                        "ig"),
+        ("Malagasy",                    "mg"),
+        ("Sesotho",                     "st"),
+        ("Shona",                       "sn"),
+        ("Somali",                      "so"),
+        ("Swahili",                     "sw"),
+        ("Xhosa",                       "xh"),
+        ("Yoruba",                      "yo"),
+        ("Zulu",                        "zu"),
+        # — Americas / Other —
+        ("Cebuano",                     "ceb"),
+        ("Corsican",                    "co"),
+        ("Esperanto",                   "eo"),
+        ("Frisian",                     "fy"),
+        ("Hawaiian",                    "haw"),
+        ("Hmong",                       "hmn"),
+        ("Latin",                       "la"),
+        ("Maori",                       "mi"),
+        ("Samoan",                      "sm"),
+        ("Scots Gaelic",                "gd"),
+        ("Sindhi",                      "sd"),
+        ("Sundanese",                   "su"),
+        ("Uyghur",                      "ug"),
+        ("Yiddish",                     "yi"),
     ]
 
 __all__ = [
@@ -823,4 +1117,3 @@ __all__ = [
     'QuoteConstants',
     'LanguageConstants'
 ]
-
