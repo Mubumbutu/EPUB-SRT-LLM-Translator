@@ -16,6 +16,7 @@ logger.setLevel(logging.DEBUG)
 class EPUBCreatorLxml(QThread):
     finished = pyqtSignal(str, bool)
 
+
     def __init__(self, book, paragraphs, output_path):
         super().__init__()
         self.book = book
@@ -35,18 +36,10 @@ class EPUBCreatorLxml(QThread):
 
         self.table_tags = {'li', 'th', 'td', 'caption'}
 
-        self.alignment_enabled: bool = False
-        self.alignment_model_name: str = 'xlm-roberta-large'
-        self.alignment_device: str = 'cpu'
-        self.alignment_models_dir: str = ''
 
     def run(self):
         try:
             logger.debug(f"Starting EPUB save to: {self.output_path}")
-
-            if self.alignment_enabled:
-                logger.info("[EPUBCreator] Alignment wlaczony – uruchamiam mBERT batch...")
-                self._run_alignment()
 
             self._insert_translations()
 
@@ -59,6 +52,7 @@ class EPUBCreatorLxml(QThread):
             logger.exception("Error during EPUB creation")
             logger.error(traceback.format_exc())
             self.finished.emit(str(e), True)
+
 
     def _normalize_text(self, text: str) -> str:
         if not text:
@@ -229,8 +223,8 @@ class EPUBCreatorLxml(QThread):
             new_element = self._build_element_from_aligned_html(element, para)
             if new_element is None:
                 logger.warning(
-                    f"_build_element_from_aligned_html zwrocil None dla {para['id']} "
-                    "– fallback do legacy path"
+                    f"_build_element_from_aligned_html returned None for {para['id']} "
+                    "– falling back to legacy path"
                 )
                 new_element = self._legacy_path(element, element_name, translation, para, root)
 
@@ -304,8 +298,8 @@ class EPUBCreatorLxml(QThread):
 
             if aligned_plain == original_plain:
                 logger.warning(
-                    f"[EPUBCreator] aligned_translated_html zawiera oryginalny tekst "
-                    f"dla para {para.get('id', '?')} – fallback do legacy path"
+                    f"[EPUBCreator] aligned_translated_html contains original text "
+                    f"for para {para.get('id', '?')} – falling back to legacy path"
                 )
                 return None
 
@@ -316,8 +310,8 @@ class EPUBCreatorLxml(QThread):
             aligned_elem = etree.fromstring(aligned_html.encode('utf-8'))
         except etree.XMLSyntaxError as exc:
             logger.warning(
-                f"[EPUBCreator] Nie można sparsować aligned_translated_html: {exc}\n"
-                f"HTML (pierwsze 300 zn.): {aligned_html[:300]}"
+                f"[EPUBCreator] Cannot parse aligned_translated_html: {exc}\n"
+                f"HTML (first 300 chars): {aligned_html[:300]}"
             )
             return None
 
@@ -386,8 +380,8 @@ class EPUBCreatorLxml(QThread):
         remainder = span_text[1:]
 
         logger.debug(
-            f"[fix_drop_cap] span.first-letter zawierał '{span_text}' – "
-            f"skracam do '{first_char}', reszta: '{remainder}'"
+            f"[fix_drop_cap] span.first-letter contained '{span_text}' – "
+            f"trimming to '{first_char}', remainder: '{remainder}'"
         )
 
         span.text = first_char
@@ -398,12 +392,12 @@ class EPUBCreatorLxml(QThread):
         else:
             span.tail = remainder + current_tail
 
-        logger.debug(f"[fix_drop_cap] Naprawiono drop cap: text='{first_char}', tail='{span.tail[:50]}'")
+        logger.debug(f"[fix_drop_cap] Fixed drop cap: text='{first_char}', tail='{span.tail[:50]}'")
 
     def _create_drop_cap_span(self, element, nsmap, class_attr) -> None:
         text = element.text or ''
         if not text:
-            logger.debug("[create_drop_cap] element.text jest pusty – pomijam")
+            logger.debug("[create_drop_cap] element.text is empty – skipping")
             return
 
         first_alpha_idx = -1
@@ -413,7 +407,7 @@ class EPUBCreatorLxml(QThread):
                 break
 
         if first_alpha_idx == -1:
-            logger.debug("[create_drop_cap] Nie znaleziono litery w element.text – pomijam")
+            logger.debug("[create_drop_cap] No letter found in element.text – skipping")
             return
 
         before_text = text[:first_alpha_idx]
@@ -517,66 +511,6 @@ class EPUBCreatorLxml(QThread):
                         grandparent.insert(idx + 1, new_span)
                         new_span.tail = suffix
                 break
-
-    def _run_alignment(self):
-        try:
-            pass
-        except ImportError as exc:
-            logger.error(
-                f"[EPUBCreator] Nie mozna zaimportowac format_alignment: {exc}. "
-                "Zapisuje bez alignmentu."
-            )
-            return
-
-        engine = FormatAlignmentEngine(
-            model_name=self.alignment_model_name,
-            device=self.alignment_device,
-            local_models_dir=self.alignment_models_dir,
-        )
-
-        try:
-            logger.info(
-                f"[EPUBCreator] Ladowanie mBERT '{self.alignment_model_name}' "
-                f"na '{self.alignment_device}'..."
-            )
-            if self.alignment_models_dir:
-                logger.info(
-                    f"[EPUBCreator] Lokalny folder modeli: {self.alignment_models_dir}"
-                )
-
-            engine.load_model()
-
-            legacy_count = sum(
-                1 for p in self.paragraphs
-                if (
-                    p.get('processing_mode') == 'legacy'
-                    and p.get('is_translated')
-                    and not p.get('is_non_translatable')
-                    and not p.get('reserve_elements')
-                )
-            )
-            logger.info(
-                f"[EPUBCreator] Paragrafow legacy do alignmentu (kwalifikujacych): "
-                f"{legacy_count}"
-            )
-
-            processed = engine.align_batch(self.paragraphs)
-            logger.info(
-                f"[EPUBCreator] Alignment zakonczony: {processed} paragrafow przetworzonych."
-            )
-
-        except Exception as exc:
-            logger.error(
-                f"[EPUBCreator] Blad podczas alignmentu: {exc}. "
-                "Kontynuuje zapis bez alignmentu.",
-                exc_info=True,
-            )
-        finally:
-            try:
-                engine.unload_model()
-                logger.info("[EPUBCreator] Model mBERT zwolniony z pamieci.")
-            except Exception as exc:
-                logger.warning(f"[EPUBCreator] Blad przy zwalnianiu modelu: {exc}")
 
     def _restore_translation_to_element(self, element, para):
         logger.debug(f"\n=== RESTORE TRANSLATION ===")
@@ -804,7 +738,7 @@ class EPUBCreatorLxml(QThread):
                 if c is not element and not hasattr(c.tag, '__call__')
             )
             if not has_drop_cap_now:
-                logger.debug("[drop_cap_restore] Span first-letter zgubiony przy rebuild – odtwarzam")
+                logger.debug("[drop_cap_restore] Span first-letter lost during rebuild – restoring")
                 self._create_drop_cap_span(element, drop_cap_nsmap, drop_cap_class)
 
         logger.debug("✓ Inline restoration complete")
@@ -2825,4 +2759,3 @@ class EPUBCreatorLxml(QThread):
 
     def _create_side_by_side_table(self, original, translation, root):
         pass
-
