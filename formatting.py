@@ -291,6 +291,12 @@ class MismatchChecker:
         else:
             return self._check_mismatch_inline(para)
 
+    def check_batch_markers(self, response: str, expected_count: int) -> Tuple[bool, str]:
+        actual_count = response.count('<z>')
+        if actual_count != expected_count:
+            return True, f"Expected {expected_count} <z> markers, found {actual_count}"
+        return False, ""
+
     def _dynamic_length_mismatch(self, a: str, b: str) -> bool:
         if not a or not b:
             return False
