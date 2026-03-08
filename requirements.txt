@@ -6,3 +6,4 @@ openrouter
 deep-translator
 deepl
 transformers>=4.35.0
+PyQt6-WebEngine
