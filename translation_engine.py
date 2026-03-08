@@ -11,6 +11,100 @@ from typing import Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
+
+class BatchSplitError(Exception):
+    pass
+
+
+class SentenceBatcher:
+    def prepare_batch(self, fragments: List[Dict]) -> Tuple[str, List[int]]:
+        renumbered_texts = []
+        offsets_list = []
+        current_offset = 0
+
+        for frag in fragments:
+            original_text = frag.get('original_text', '')
+            processing_mode = frag.get('processing_mode', 'inline')
+            offset = current_offset
+
+            if processing_mode == 'legacy':
+                def _renumber_legacy(m, off=offset):
+                    return f"<id_{int(m.group(1)) + off:02d}>"
+                def _renumber_legacy_close(m, off=offset):
+                    return f"</id_{int(m.group(1)) + off:02d}>"
+                text = re.sub(r'<id_(\d+)>', _renumber_legacy, original_text)
+                text = re.sub(r'</id_(\d+)>', _renumber_legacy_close, text)
+                offset_size = len(frag.get('reserve_elements', []))
+            else:
+                def _renumber_inline(m, off=offset):
+                    return f"<p_{int(m.group(1)) + off:02d}>"
+                def _renumber_inline_close(m, off=offset):
+                    return f"</p_{int(m.group(1)) + off:02d}>"
+                text = re.sub(r'<p_(\d+)>', _renumber_inline, original_text)
+                text = re.sub(r'</p_(\d+)>', _renumber_inline_close, text)
+                offset_size = len(frag.get('inline_formatting_map', {}))
+
+            renumbered_texts.append(text)
+            offsets_list.append(offset)
+            current_offset += offset_size
+
+        return '<z>'.join(renumbered_texts), offsets_list
+
+    def split_response(self, response: str, n: int, offsets: List[int]) -> List[str]:
+        parts = response.split('<z>')
+        if len(parts) != n:
+            raise BatchSplitError(
+                f"Expected {n} segments, found {len(parts)}"
+            )
+
+        result = []
+        for i, part in enumerate(parts):
+            off = offsets[i]
+            if off == 0:
+                result.append(part)
+                continue
+
+            def _restore_legacy_open(m, o=off):
+                return f"<id_{int(m.group(1)) - o:02d}>"
+            def _restore_legacy_close(m, o=off):
+                return f"</id_{int(m.group(1)) - o:02d}>"
+            def _restore_inline_open(m, o=off):
+                return f"<p_{int(m.group(1)) - o:02d}>"
+            def _restore_inline_close(m, o=off):
+                return f"</p_{int(m.group(1)) - o:02d}>"
+
+            restored = re.sub(r'<id_(\d+)>', _restore_legacy_open, part)
+            restored = re.sub(r'</id_(\d+)>', _restore_legacy_close, restored)
+            restored = re.sub(r'<p_(\d+)>', _restore_inline_open, restored)
+            restored = re.sub(r'</p_(\d+)>', _restore_inline_close, restored)
+            result.append(restored)
+
+        return result
+
+    @staticmethod
+    def count_sentence_markers(text: str) -> int:
+        return text.count('<z>')
+
+    def build_batch_hint(self, n: int, template: str = "") -> str:
+        marker_count = n - 1
+        if template:
+            return template.replace("{n}", str(n)).replace("{marker_count}", str(marker_count))
+        example_in = "Hello world.<z>How are you?<z>Fine, thanks."
+        example_out = "Hola mundo.<z>¿Cómo estás?<z>Bien, gracias."
+        return (
+            f"=== CRITICAL BATCH INSTRUCTION ===\n"
+            f"The text below contains exactly {marker_count} separator marker(s) <z> dividing it into {n} separate paragraphs.\n"
+            f"RULES — you MUST follow ALL of them:\n"
+            f"1. Preserve every <z> marker exactly as-is — do NOT remove, add, move, or translate them.\n"
+            f"2. Output EXACTLY {marker_count} <z> marker(s) in your translation — no more, no fewer.\n"
+            f"3. The <z> marker is NOT an HTML tag — treat it as a literal paragraph boundary separator.\n"
+            f"4. Translate each segment between <z> markers independently.\n"
+            f"Example input:  {example_in}\n"
+            f"Example output: {example_out}\n"
+            f"==================================="
+        )
+
+
 class LLMClient(ABC):
     @abstractmethod
     def translate(
@@ -25,18 +119,72 @@ class LMStudioClient(LLMClient):
     def __init__(self, endpoint: str = "http://localhost:1234/v1/chat/completions"):
         self.endpoint = endpoint
         self._active_session = None
+        self._active_response = None
         self._session_lock = threading.Lock()
+        self._abort_event = threading.Event()
         logger.info(f"Initialized LM Studio client: {endpoint}")
 
     def abort(self):
+        self._abort_event.set()
         with self._session_lock:
+            if self._active_response is not None:
+                try:
+                    self._active_response.close()
+                    logger.info("LMStudioClient: response closed (hard cancel)")
+                except Exception as e:
+                    logger.warning(f"LMStudioClient: response close error: {e}")
+                self._active_response = None
             if self._active_session is not None:
                 try:
                     self._active_session.close()
-                    logger.info("LMStudioClient: sesja zamknięta (hard cancel)")
+                    logger.info("LMStudioClient: session closed (hard cancel)")
                 except Exception as e:
-                    logger.warning(f"LMStudioClient: błąd zamykania sesji: {e}")
+                    logger.warning(f"LMStudioClient: session close error: {e}")
                 self._active_session = None
+
+    def _stream_response(self, session, payload, headers, timeout_seconds):
+        chunks = []
+        response = session.post(
+            self.endpoint,
+            json=payload,
+            headers=headers,
+            timeout=timeout_seconds,
+            stream=True
+        )
+        response.raise_for_status()
+
+        with self._session_lock:
+            self._active_response = response
+
+        try:
+            for line in response.iter_lines():
+                if self._abort_event.is_set():
+                    logger.info("LMStudioClient: abort detected mid-stream")
+                    response.close()
+                    raise requests.RequestException("Aborted by user")
+
+                if not line:
+                    continue
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8")
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                try:
+                    data = json.loads(line)
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    token = delta.get("content")
+                    if token:
+                        chunks.append(token)
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    continue
+        finally:
+            with self._session_lock:
+                if self._active_response is response:
+                    self._active_response = None
+
+        return "".join(chunks)
 
     def translate(
         self,
@@ -44,6 +192,7 @@ class LMStudioClient(LLMClient):
         temperature: float,
         timeout_seconds: int
     ) -> str:
+        self._abort_event.clear()
         headers = {"Content-Type": "application/json"}
 
         session = requests.Session()
@@ -54,8 +203,8 @@ class LMStudioClient(LLMClient):
             if isinstance(prompt, dict) and "__json_payload__" in prompt:
                 payload = prompt["__json_payload__"]
                 response_field = prompt.get("__response_field__", "").strip()
-
                 payload["temperature"] = temperature
+                payload["stream"] = False
 
                 logger.debug(f"JSON payload request: timeout={timeout_seconds}s, response_field='{response_field}'")
 
@@ -63,10 +212,22 @@ class LMStudioClient(LLMClient):
                     self.endpoint,
                     json=payload,
                     headers=headers,
-                    timeout=timeout_seconds
+                    timeout=timeout_seconds,
+                    stream=True
                 )
                 response.raise_for_status()
-                data = response.json()
+
+                with self._session_lock:
+                    self._active_response = response
+
+                try:
+                    if self._abort_event.is_set():
+                        raise requests.RequestException("Aborted by user")
+                    data = response.json()
+                finally:
+                    with self._session_lock:
+                        if self._active_response is response:
+                            self._active_response = None
 
                 if response_field:
                     try:
@@ -143,36 +304,17 @@ class LMStudioClient(LLMClient):
                     "messages": prompt,
                     "temperature": temperature,
                     "max_tokens": -1,
-                    "stream": False
+                    "stream": True
                 }
 
-                logger.debug(f"LM Studio request: temp={temperature}, timeout={timeout_seconds}s")
+                logger.debug(f"LM Studio streaming request: temp={temperature}, timeout={timeout_seconds}s")
 
-                response = session.post(
-                    self.endpoint,
-                    json=payload,
-                    headers=headers,
-                    timeout=timeout_seconds
-                )
-                response.raise_for_status()
-                data = response.json()
+                content = self._stream_response(session, payload, headers, timeout_seconds)
 
-                choices = data.get("choices", [])
-                if not choices:
-                    raw = json.dumps(data)[:400]
-                    raise ValueError(
-                        f"Server returned 200 OK but 'choices' is empty or missing.\n"
-                        f"Possible cause: model is not loaded or the server does not support the chat/completions endpoint.\n"
-                        f"Raw response: {raw}"
-                    )
-
-                content = choices[0].get("message", {}).get("content", "")
                 if not content:
-                    raw = json.dumps(data)[:400]
                     raise ValueError(
-                        f"Server returned 200 OK but 'content' is empty.\n"
-                        f"Make sure the model is fully loaded and supports the chat/completions format.\n"
-                        f"Raw response: {raw}"
+                        "Server returned 200 OK but 'content' is empty.\n"
+                        "Make sure the model is fully loaded and supports the chat/completions format."
                     )
 
                 logger.debug(f"LM Studio response: {len(content)} chars")
@@ -183,6 +325,8 @@ class LMStudioClient(LLMClient):
             raise TimeoutError(f"LM Studio request timed out after {timeout_seconds}s")
 
         except requests.RequestException as e:
+            if self._abort_event.is_set():
+                raise
             logger.error(f"LM Studio request failed: {e}")
             raise
 
@@ -190,7 +334,7 @@ class LMStudioClient(LLMClient):
             with self._session_lock:
                 if self._active_session is session:
                     self._active_session = None
-
+                
 class OllamaClient(LLMClient):
     def __init__(
         self,
@@ -209,9 +353,9 @@ class OllamaClient(LLMClient):
             if self._active_session is not None:
                 try:
                     self._active_session.close()
-                    logger.info("OllamaClient: sesja zamknięta (hard cancel)")
+                    logger.info("OllamaClient: session closed (hard cancel)")
                 except Exception as e:
-                    logger.warning(f"OllamaClient: błąd zamykania sesji: {e}")
+                    logger.warning(f"OllamaClient: session close error: {e}")
                 self._active_session = None
 
     def translate(
@@ -486,51 +630,46 @@ class PromptBuilder:
         context_after: str = "",
         auto_fix_section: str = ""
     ) -> Union[str, List[Dict]]:
-        if self.json_payload_template is not None:
-            def json_escape(value: str) -> str:
-                return json.dumps(value)[1:-1]
 
-            filled = self.json_payload_template.replace("{core_text}", json_escape(core_text))
-            filled = filled.replace("{context_before}", json_escape(context_before))
-            filled = filled.replace("{context_after}", json_escape(context_after))
+        batch_hint = ""
+        try:
+            if hasattr(self, '_pending_batch_hint'):
+                batch_hint = self._pending_batch_hint
+        finally:
+            if hasattr(self, '_pending_batch_hint'):
+                delattr(self, '_pending_batch_hint')
+
+        if self.json_payload_template is not None:
+            filled_content = (
+                self.json_payload_template
+                .replace("{core_text}", core_text)
+                .replace("{context_before}", context_before)
+                .replace("{context_after}", context_after)
+            )
+
+            if batch_hint:
+                filled_content = batch_hint + "\n\n" + filled_content
 
             if auto_fix_section and auto_fix_section.strip():
-                auto_fix_formatted = (
-                    "\\n\\n"
-                    "=== AUTO-FIX INSTRUCTIONS - CRITICAL ===\\n"
-                    "You MUST fix the following issues in your previous translation:\\n\\n"
-                    + json_escape(auto_fix_section.strip()) +
-                    "\\n\\n"
-                    "=== END OF AUTO-FIX INSTRUCTIONS ===\\n"
+                filled_content = (
+                    filled_content.rstrip()
+                    + "\n\n"
+                    "=== AUTO-FIX INSTRUCTIONS - CRITICAL ===\n"
+                    "You MUST fix the following issues in your previous translation:\n\n"
+                    + auto_fix_section.strip()
+                    + "\n\n"
+                    "=== END OF AUTO-FIX INSTRUCTIONS ===\n"
                     "Return ONLY the corrected translation in the same JSON format as before."
                 )
 
-                try:
-                    payload_dict = json.loads(filled)
-                    if isinstance(payload_dict, dict):
-                        # Najpierw próbujemy dodać do pola "messages"
-                        if "messages" in payload_dict and isinstance(payload_dict["messages"], list):
-                            for msg in payload_dict["messages"]:
-                                if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-                                    msg["content"] = msg["content"].rstrip() + auto_fix_formatted
-                                    break
-                        elif isinstance(payload_dict.get("content"), str):
-                            payload_dict["content"] = payload_dict["content"].rstrip() + auto_fix_formatted
-                        # Fallback
-                        else:
-                            filled = filled.rstrip() + auto_fix_formatted
-                    else:
-                        filled = filled.rstrip() + auto_fix_formatted
-                except (json.JSONDecodeError, TypeError):
-                    filled = filled.rstrip() + auto_fix_formatted
-
-            try:
-                payload_dict = json.loads(filled)
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Invalid JSON Payload Template: {e}\n"
-                    f"Check the template in the LLM Instructions Editor."
-                )
+            payload_dict = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": filled_content
+                    }
+                ]
+            }
 
             return {
                 "__json_payload__": payload_dict,
@@ -543,50 +682,56 @@ class PromptBuilder:
                 context_before=context_before,
                 context_after=context_after
             )
+            if batch_hint:
+                prompt = prompt + "\n\n" + batch_hint
             if auto_fix_section:
                 prompt += "\n\n" + auto_fix_section
             return prompt
 
+        system_content = self.system_template.format(
+            core_text=core_text,
+            context_before=context_before,
+            context_after=context_after
+        ) if self.system_template else ""
+
+        assistant_content = self.assistant_template.format(
+            core_text=core_text,
+            context_before=context_before,
+            context_after=context_after
+        ) if self.assistant_template else ""
+
+        user_content = self.user_template.format(
+            core_text=core_text,
+            context_before=context_before,
+            context_after=context_after
+        ) if self.user_template else ""
+
+        if batch_hint:
+            if system_content:
+                system_content = system_content + "\n\n" + batch_hint
+            user_content = user_content + "\n\n" + batch_hint
+
+        if auto_fix_section:
+            user_content += "\n\n" + auto_fix_section
+
+        if self.single_prompt_mode:
+            merged = ""
+            if system_content:
+                merged += system_content + "\n\n"
+            if assistant_content:
+                merged += assistant_content + "\n\n"
+            if user_content:
+                merged += user_content
+            return [{"role": "user", "content": merged}]
         else:
-            system_content = self.system_template.format(
-                core_text=core_text,
-                context_before=context_before,
-                context_after=context_after
-            ) if self.system_template else ""
-
-            assistant_content = self.assistant_template.format(
-                core_text=core_text,
-                context_before=context_before,
-                context_after=context_after
-            ) if self.assistant_template else ""
-
-            user_content = self.user_template.format(
-                core_text=core_text,
-                context_before=context_before,
-                context_after=context_after
-            ) if self.user_template else ""
-
-            if auto_fix_section:
-                user_content += "\n\n" + auto_fix_section
-
-            if self.single_prompt_mode:
-                merged = ""
-                if system_content:
-                    merged += system_content + "\n\n"
-                if assistant_content:
-                    merged += assistant_content + "\n\n"
-                if user_content:
-                    merged += user_content
-                return [{"role": "user", "content": merged}]
-            else:
-                messages = []
-                if system_content:
-                    messages.append({"role": "system", "content": system_content})
-                if assistant_content:
-                    messages.append({"role": "assistant", "content": assistant_content})
-                if user_content:
-                    messages.append({"role": "user", "content": user_content})
-                return messages
+            messages = []
+            if system_content:
+                messages.append({"role": "system", "content": system_content})
+            if assistant_content:
+                messages.append({"role": "assistant", "content": assistant_content})
+            if user_content:
+                messages.append({"role": "user", "content": user_content})
+            return messages
 
 class AutoFixManager:
     def __init__(self, max_attempts: int, base_temperature: float):
