@@ -16,10 +16,6 @@ NAMESPACES = {
     'ncx': 'http://www.daisy.org/z3986/2005/ncx/'
 }
 
-for prefix, uri in NAMESPACES.items():
-    if prefix != 'x':
-        etree.register_namespace(prefix, uri)
-
 class OEBItem:
     def __init__(self, href, content_bytes, media_type='text/html'):
         self.href = href
@@ -54,14 +50,24 @@ class OEBItem:
             )
         return self.original_bytes
 
+class OEBImageItem:
+    def __init__(self, item_id, href, media_type, content):
+        self.id = item_id
+        self.file_name = href
+        self.href = href
+        self.media_type = media_type
+        self.content = content
+
 class OEBBook:
     def __init__(self, epub_path):
         self.epub_path = epub_path
         self.temp_dir = None
         self.items = []
+        self.image_items = []
         self.metadata = {}
         self.opf_path = None
         self.content_dir = None
+        self.manifest_items = []
 
         self._extract_epub()
         self._parse_container()
@@ -104,6 +110,8 @@ class OEBBook:
         metadata_elem = root.find('.//opf:metadata', namespaces=NAMESPACES)
         if metadata_elem is not None:
             for elem in metadata_elem:
+                if not isinstance(elem.tag, str):
+                    continue
                 tag = etree.QName(elem).localname
                 self.metadata[tag] = elem.text
 
@@ -121,28 +129,39 @@ class OEBBook:
         logger.debug(f"Found {len(self.manifest_items)} items in manifest")
 
     def _load_items(self):
+        IMAGE_TYPES = {
+            'image/jpeg', 'image/png', 'image/gif',
+            'image/bmp', 'image/webp', 'image/svg+xml',
+        }
+
         for manifest_item in self.manifest_items:
             media_type = manifest_item['media_type']
-
-            if media_type not in ('text/html', 'application/xhtml+xml'):
-                continue
-
             href = manifest_item['href']
+            item_id = manifest_item['id']
             file_path = os.path.join(self.content_dir, href)
 
-            if not os.path.exists(file_path):
-                logger.warning(f"File not found: {file_path}")
-                continue
+            if media_type in ('text/html', 'application/xhtml+xml'):
+                if not os.path.exists(file_path):
+                    logger.warning(f"File not found: {file_path}")
+                    continue
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+                item = OEBItem(href, content, media_type)
+                self.items.append(item)
 
-            with open(file_path, 'rb') as f:
-                content = f.read()
+            elif media_type in IMAGE_TYPES:
+                if not os.path.exists(file_path):
+                    logger.warning(f"Image file not found: {file_path}")
+                    continue
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+                self.image_items.append(OEBImageItem(item_id, href, media_type, content))
 
-            item = OEBItem(href, content, media_type)
-            self.items.append(item)
-
-        logger.debug(f"Loaded {len(self.items)} HTML/XHTML items")
+        logger.debug(f"Loaded {len(self.items)} HTML/XHTML items, {len(self.image_items)} image items")
 
     def get_items_of_type(self, item_type='DOCUMENT'):
+        if item_type == 'IMAGE':
+            return self.image_items
         return self.items
 
     def save(self, output_path):
@@ -182,7 +201,8 @@ class OEBBook:
             logger.debug(f"Cleaned up temp dir: {self.temp_dir}")
 
     def __del__(self):
-        self.cleanup()
+        if getattr(self, 'temp_dir', None):
+            self.cleanup()
 
 def read_epub(epub_path):
     return OEBBook(epub_path)
