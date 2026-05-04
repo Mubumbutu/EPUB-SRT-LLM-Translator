@@ -111,7 +111,9 @@ class LLMClient(ABC):
         self,
         prompt: Union[str, List[Dict]],
         temperature: float,
-        timeout_seconds: int
+        timeout_seconds: int,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None
     ) -> str:
         pass
 
@@ -190,7 +192,9 @@ class LMStudioClient(LLMClient):
         self,
         prompt,
         temperature: float,
-        timeout_seconds: int
+        timeout_seconds: int,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None
     ) -> str:
         self._abort_event.clear()
         headers = {"Content-Type": "application/json"}
@@ -204,6 +208,10 @@ class LMStudioClient(LLMClient):
                 payload = prompt["__json_payload__"]
                 response_field = prompt.get("__response_field__", "").strip()
                 payload["temperature"] = temperature
+                if top_p is not None:
+                    payload["top_p"] = top_p
+                if top_k is not None:
+                    payload["top_k"] = top_k
                 payload["stream"] = False
 
                 logger.debug(f"JSON payload request: timeout={timeout_seconds}s, response_field='{response_field}'")
@@ -306,6 +314,10 @@ class LMStudioClient(LLMClient):
                     "max_tokens": -1,
                     "stream": True
                 }
+                if top_p is not None:
+                    payload["top_p"] = top_p
+                if top_k is not None:
+                    payload["top_k"] = top_k
 
                 logger.debug(f"LM Studio streaming request: temp={temperature}, timeout={timeout_seconds}s")
 
@@ -343,11 +355,11 @@ class OllamaClient(LLMClient):
     ):
         self.model_name = model_name
         self.endpoint = endpoint
-        self.api_url = f"{endpoint}/api/generate"
+        self.api_url = f"{endpoint.rstrip('/')}/api/chat"
         self._active_session = None
         self._session_lock = threading.Lock()
         logger.info(f"Initialized Ollama client: {endpoint} (model: {model_name})")
-
+ 
     def abort(self):
         with self._session_lock:
             if self._active_session is not None:
@@ -357,17 +369,30 @@ class OllamaClient(LLMClient):
                 except Exception as e:
                     logger.warning(f"OllamaClient: session close error: {e}")
                 self._active_session = None
-
+ 
     def translate(
         self,
         prompt: str,
         temperature: float,
-        timeout_seconds: int
+        timeout_seconds: int,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None
     ) -> str:
+        if isinstance(prompt, list):
+            messages = prompt
+        else:
+            messages = [{"role": "user", "content": prompt}]
+
+        options = {"temperature": temperature}
+        if top_p is not None:
+            options["top_p"] = top_p
+        if top_k is not None:
+            options["top_k"] = top_k
+
         payload = {
             "model": self.model_name,
-            "prompt": prompt,
-            "temperature": temperature,
+            "messages": messages,
+            "options": options,
             "stream": False
         }
         headers = {"Content-Type": "application/json"}
@@ -386,7 +411,7 @@ class OllamaClient(LLMClient):
             )
             response.raise_for_status()
             data = response.json()
-            content = data.get("response", "")
+            content = data.get("message", {}).get("content", "")
             if not content:
                 logger.warning("Ollama returned empty response")
                 return ""
@@ -459,16 +484,10 @@ class OpenRouterClient(LLMClient):
         prompt: List[Dict],
         temperature: float,
         timeout_seconds: int,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         max_retries: int = 5
     ) -> str:
-        try:
-            pass
-        except ImportError:
-            raise ImportError(
-                "openrouter package is not installed.\n"
-                "Run: pip install openrouter"
-            )
-
         for attempt in range(1, max_retries + 1):
             self._wait_for_rate_limit()
 
@@ -481,11 +500,18 @@ class OpenRouterClient(LLMClient):
                     f"timeout={timeout_seconds}s, free={self.is_free_model}"
                 )
 
+                extra_params = {}
+                if top_p is not None:
+                    extra_params["top_p"] = top_p
+                if top_k is not None:
+                    extra_params["top_k"] = top_k
+
                 with OpenRouter(api_key=self.api_key) as client:
                     response = client.chat.send(
                         model=self.model_name,
                         messages=prompt,
-                        temperature=temperature
+                        temperature=temperature,
+                        **extra_params
                     )
 
                 if not response.choices:
@@ -630,7 +656,7 @@ class PromptBuilder:
         context_after: str = "",
         auto_fix_section: str = ""
     ) -> Union[str, List[Dict]]:
-
+ 
         batch_hint = ""
         try:
             if hasattr(self, '_pending_batch_hint'):
@@ -638,7 +664,7 @@ class PromptBuilder:
         finally:
             if hasattr(self, '_pending_batch_hint'):
                 delattr(self, '_pending_batch_hint')
-
+ 
         if self.json_payload_template is not None:
             filled_content = (
                 self.json_payload_template
@@ -646,10 +672,10 @@ class PromptBuilder:
                 .replace("{context_before}", context_before)
                 .replace("{context_after}", context_after)
             )
-
+ 
             if batch_hint:
                 filled_content = batch_hint + "\n\n" + filled_content
-
+ 
             if auto_fix_section and auto_fix_section.strip():
                 filled_content = (
                     filled_content.rstrip()
@@ -661,21 +687,36 @@ class PromptBuilder:
                     "=== END OF AUTO-FIX INSTRUCTIONS ===\n"
                     "Return ONLY the corrected translation in the same JSON format as before."
                 )
-
+ 
+            content_value: object = filled_content
+            stripped = filled_content.strip()
+            if stripped.startswith(("[", "{")):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, (list, dict)):
+                        content_value = parsed
+                        logger.debug(
+                            f"JSON Payload: content parsed as "
+                            f"{'list' if isinstance(parsed, list) else 'dict'} "
+                            f"({len(parsed) if isinstance(parsed, list) else len(parsed.keys())} items)"
+                        )
+                except json.JSONDecodeError:
+                    pass
+ 
             payload_dict = {
                 "messages": [
                     {
                         "role": "user",
-                        "content": filled_content
+                        "content": content_value
                     }
                 ]
             }
-
+ 
             return {
                 "__json_payload__": payload_dict,
                 "__response_field__": self.json_response_field
             }
-
+ 
         if self.ollama_template is not None:
             prompt = self.ollama_template.format(
                 core_text=core_text,
@@ -687,33 +728,33 @@ class PromptBuilder:
             if auto_fix_section:
                 prompt += "\n\n" + auto_fix_section
             return prompt
-
+ 
         system_content = self.system_template.format(
             core_text=core_text,
             context_before=context_before,
             context_after=context_after
         ) if self.system_template else ""
-
+ 
         assistant_content = self.assistant_template.format(
             core_text=core_text,
             context_before=context_before,
             context_after=context_after
         ) if self.assistant_template else ""
-
+ 
         user_content = self.user_template.format(
             core_text=core_text,
             context_before=context_before,
             context_after=context_after
         ) if self.user_template else ""
-
+ 
         if batch_hint:
             if system_content:
                 system_content = system_content + "\n\n" + batch_hint
             user_content = user_content + "\n\n" + batch_hint
-
+ 
         if auto_fix_section:
             user_content += "\n\n" + auto_fix_section
-
+ 
         if self.single_prompt_mode:
             merged = ""
             if system_content:
@@ -1073,7 +1114,7 @@ class AutoFixManager:
         if not clean_text:
             return None, "empty"
 
-        ALL_QUOTES = r'["\'\\u2018\\u2019\\u201C\\u201D\\u201E\\u201F\\u00AB\\u00BB\\u2039\\u203A\\u201A\\u201B\\u2032\\u2033\\u301D\\u301E\\u301F\\uFF02]'
+        ALL_QUOTES = '["\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
         text_no_quotes = re.sub(f'^{ALL_QUOTES}+', '', clean_text).lstrip()
 
         if not text_no_quotes:
@@ -1101,7 +1142,7 @@ class AutoFixManager:
         if not clean_text:
             return {'char': None, 'type': 'empty', 'description': 'empty text'}
 
-        ALL_QUOTES = r'["\'\\u2018\\u2019\\u201C\\u201D\\u201E\\u201F\\u00AB\\u00BB\\u2039\\u203A\\u201A\\u201B\\u2032\\u2033\\u301D\\u301E\\u301F\\uFF02]'
+        ALL_QUOTES = '["\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
         text_no_quotes = re.sub(f'{ALL_QUOTES}+$', '', clean_text).rstrip()
 
         if not text_no_quotes:
@@ -1387,7 +1428,9 @@ class TranslationOrchestrator:
         temperature: float,
         auto_fix_manager: Optional[AutoFixManager] = None,
         mismatch_checker: Optional['MismatchChecker'] = None,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[callable] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None
     ) -> str:
         core_text = fragment['original_text']
 
@@ -1496,7 +1539,9 @@ class TranslationOrchestrator:
                 response = self.llm_client.translate(
                     prompt,
                     temperature,
-                    self.timeout_seconds
+                    self.timeout_seconds,
+                    top_p=top_p,
+                    top_k=top_k
                 )
 
                 elapsed = time.time() - start_time
