@@ -6,12 +6,74 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 ALL_QUOTES_CHARS = '"\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02'
-DOUBLE_QUOTES_CHARS = '"\u201C\u201D\u201E\u201F\u00AB\u00BB\u301D\u301E\u301F\uFF02'
+DOUBLE_QUOTES_CHARS = '"\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u301D\u301E\u301F\uFF02'
 SINGLE_QUOTES_CHARS = '\'\u2018\u2019\u201A\u201B\u2032\u2039\u203A'
 
 ALL_QUOTES = r'["\'\u2018\u2019\u201C\u201D\u201E\u201F\u00AB\u00BB\u2039\u203A\u201A\u201B\u2032\u2033\u301D\u301E\u301F\uFF02]'
 DOUBLE_QUOTES = r'["\u201C\u201D\u201E\u201F\u00AB\u00BB\u301D\u301E\u301F\uFF02]'
 SINGLE_QUOTES = r'[\'\u2018\u2019\u201A\u201B\u2032\u2039\u203A]'
+
+QUOTE_STYLE_OPTIONS = {
+    "neutral":      ('"',      '"'),
+    "polish":       ('\u201E', '\u201D'),
+    "english":      ('\u201C', '\u201D'),
+    "german":       ('\u201E', '\u201C'),
+    "french":       ('\u00AB', '\u00BB'),
+    "french_inner": ('\u2039', '\u203A'),
+    "swedish":      ('\u00BB', '\u00AB'),
+    "swiss":        ('\u00AB', '\u00BB'),
+    "russian":      ('\u00AB', '\u00BB'),
+    "cjk":          ('\u301D', '\u301E'),
+}
+
+QUOTE_STYLE_LABELS = [
+    ("neutral",      '"  "   — neutral ASCII'),
+    ("polish",       '\u201E  \u201D   — Polish / German (low-high)'),
+    ("english",      '\u201C  \u201D   — English typographic'),
+    ("german",       '\u201E  \u201C   — German alt (low-high reversed)'),
+    ("french",       '\u00AB  \u00BB   — French / Russian guillemets'),
+    ("french_inner", '\u2039  \u203A   — single guillemets'),
+    ("swedish",      '\u00BB  \u00AB   — Swedish / Finnish (reversed)'),
+    ("cjk",          '\u301D  \u301E   — CJK / Japanese'),
+]
+
+
+def apply_quote_style_to_text(text: str, open_char: str, close_char: str) -> str:
+    DOUBLE_QUOTES_VARIANTS = [
+        '"',
+        '\u201C', '\u201D', '\u201E', '\u201F',
+        '\u00AB', '\u00BB',
+        '\u2039', '\u203A',
+        '\u301D', '\u301E', '\u301F',
+        '\uFF02', '\u275D', '\u275E',
+    ]
+    result = text
+    for variant in DOUBLE_QUOTES_VARIANTS:
+        result = result.replace(variant, '"')
+
+    if open_char == '"' and close_char == '"':
+        return result
+
+    out = []
+    inside = False
+    for ch in result:
+        if ch == '"':
+            if not inside:
+                out.append(open_char)
+                inside = True
+            else:
+                out.append(close_char)
+                inside = False
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+def _is_ellipsis_ending(text: str) -> bool:
+    if not text:
+        return False
+    normalized = text.replace('\u00a0', ' ')
+    tail = normalized[-12:]
+    return bool(re.search(r'\.\s*\.\s*\.\s*$|…$', tail))
 
 def count_quotes(text: str) -> int:
     return len(re.findall(ALL_QUOTES, text))
@@ -50,7 +112,15 @@ def has_quote_at_end(text: str) -> bool:
     if not text_no_placeholders:
         return False
 
-    return bool(re.match(ALL_QUOTES, text_no_placeholders[-1]))
+    if re.match(ALL_QUOTES, text_no_placeholders[-1]):
+        return True
+
+    text_no_trailing_punct = re.sub(r'[.!?,…]+$', '', text_no_placeholders)
+    if text_no_trailing_punct and text_no_trailing_punct != text_no_placeholders:
+        if re.match(ALL_QUOTES, text_no_trailing_punct[-1]):
+            return True
+
+    return False
 
 def contains_dash(text: str) -> bool:
     return '-' in text or '–' in text or '—' in text
@@ -72,7 +142,7 @@ def count_external_quotes(text: str) -> int:
 
     return count
 
-def add_quote_to_start(text: str) -> str:
+def add_quote_to_start(text: str, quote_char: str = '"') -> str:
     stripped = text.lstrip()
     leading_ws = text[:len(text) - len(stripped)]
 
@@ -80,11 +150,12 @@ def add_quote_to_start(text: str) -> str:
     if match:
         placeholders = match.group(0)
         content = stripped[len(placeholders):]
-        return leading_ws + placeholders + '\u201e' + content
+        return leading_ws + placeholders + quote_char + content
     else:
-        return leading_ws + '\u201e' + stripped
+        return leading_ws + quote_char + stripped
 
-def add_quote_to_end(text: str) -> str:
+
+def add_quote_to_end(text: str, quote_char: str = '"') -> str:
     stripped = text.rstrip()
     trailing_ws = text[len(stripped):]
 
@@ -92,9 +163,9 @@ def add_quote_to_end(text: str) -> str:
     if match:
         placeholders = match.group(0)
         content = stripped[:len(stripped) - len(placeholders)]
-        return content + '\u201d' + placeholders + trailing_ws
+        return content + quote_char + placeholders + trailing_ws
     else:
-        return stripped + '\u201d' + trailing_ws
+        return stripped + quote_char + trailing_ws
 
 def remove_quote_from_start(text: str, force: bool = False) -> str:
     stripped = text.lstrip()
@@ -147,8 +218,10 @@ def remove_quote_from_end(text: str, force: bool = False) -> str:
 def get_first_letter_info(text: str) -> Tuple[Optional[int], Optional[bool]]:
     text_work = text.lstrip()
 
-    if text_work.startswith('- '):
-        text_work = text_work[2:].lstrip()
+    for dash in ['\u2014 ', '\u2013 ', '- ']:
+        if text_work.startswith(dash):
+            text_work = text_work[len(dash):].lstrip()
+            break
 
     text_work = re.sub(f'^{ALL_QUOTES}+', '', text_work).lstrip()
 
@@ -176,6 +249,9 @@ def get_ending_punctuation(text: str) -> Tuple[Optional[str], Optional[int]]:
     if not text_no_quotes:
         return None, None
 
+    if _is_ellipsis_ending(text_no_quotes):
+        return 'ellipsis', len(text_no_quotes) - 1
+
     last_char = text_no_quotes[-1]
 
     if last_char == '.':
@@ -188,6 +264,10 @@ def get_ending_punctuation(text: str) -> Tuple[Optional[str], Optional[int]]:
         return 'question', len(text_no_quotes) - 1
     elif last_char == '…':
         return 'ellipsis', len(text_no_quotes) - 1
+    elif last_char == ';':
+        return 'semicolon', len(text_no_quotes) - 1
+    elif last_char == ':':
+        return 'colon', len(text_no_quotes) - 1
 
     return None, None
 
@@ -318,28 +398,40 @@ class MismatchChecker:
         return ratio > threshold
 
     def _check_untranslated_with_threshold(self, orig: str, trans: str) -> bool:
-        if orig.strip() != trans.strip():
-            return False
-        text = orig.strip()
-        if not text:
+        orig_s = orig.strip()
+        trans_s = trans.strip()
+        if not orig_s or not trans_s:
             return False
         url_pattern = re.compile(
             r'^(https?://\S+|www\.\S+|\S+@\S+\.\S+|[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}(/\S*)?)$',
             re.IGNORECASE
         )
-        if url_pattern.match(text):
-            return False
-        if ' ' not in text and '\n' not in text:
-            return False
-        words = re.findall(r'[^\W\d_]+', text, re.UNICODE)
-        if not words:
-            return False
-        if len(words) <= 2:
-            return False
-        lowercase_words = [w for w in words if w[0].islower()]
-        ratio = len(lowercase_words) / len(words)
-        threshold = self.thresholds.get("untranslated_ratio", 0.3)
-        return ratio > threshold
+        if orig_s == trans_s:
+            text = orig_s
+            if url_pattern.match(text):
+                return False
+            if ' ' not in text and '\n' not in text:
+                return False
+            words = re.findall(r'[^\W\d_]+', text, re.UNICODE)
+            if not words or len(words) <= 2:
+                return False
+            uppercase_words = [w for w in words if w[0].isupper()]
+            if len(uppercase_words) / len(words) > 0.7:
+                return False
+            lowercase_words = [w for w in words if w[0].islower()]
+            ratio = len(lowercase_words) / len(words)
+            threshold = self.thresholds.get("untranslated_ratio", 0.3)
+            return ratio > threshold
+        if trans_s.startswith(orig_s) and len(trans_s) > len(orig_s):
+            if url_pattern.match(orig_s):
+                return False
+            if ' ' not in orig_s and '\n' not in orig_s:
+                return False
+            words = re.findall(r'[^\W\d_]+', orig_s, re.UNICODE)
+            if not words or len(words) <= 2:
+                return False
+            return True
+        return False
 
     def _detect_raw_html_and_drift(self, orig: str, trans_raw: str, trans: str) -> Dict:
         flags = {}
@@ -347,7 +439,7 @@ class MismatchChecker:
         unexpected = re.findall(r'</?([a-zA-Z][^>\s]*)[^>]*>', trans_raw)
 
         def _is_allowed_tag(tag: str) -> bool:
-            t = tag.lower()
+            t = tag.lower().rstrip('/')
             if t in {'p', 'id', 'nt', 'ps', 'translated', 'translation'}:
                 return True
             if re.match(r'^/?(?:p|id|nt)_\d{2}$', t):
@@ -360,7 +452,7 @@ class MismatchChecker:
 
         orig_words = set(re.findall(r'\b\w+\b', orig.lower()))
         trans_words = set(re.findall(r'\b\w+\b', trans.lower()))
-        if orig_words and len(trans) > len(orig) * 1.6:
+        if orig_words and len(orig_words) >= 5 and len(trans) > len(orig) * 2.0:
             overlap = len(orig_words & trans_words) / len(orig_words)
             if overlap < 0.40:
                 flags["content_drift"] = True
@@ -428,7 +520,7 @@ class MismatchChecker:
             t = t.rstrip()
             if not t: return {"type": "quote_only"}
             lc = t[-1]
-            if lc == '.' and t.endswith('...'): return {"type": "ellipsis"}
+            if lc == '.' and _is_ellipsis_ending(t): return {"type": "ellipsis"}
             mapping = {'.': 'period', ',': 'comma', '!': 'exclamation', '?': 'question', '…': 'ellipsis'}
             if lc in mapping: return {"type": mapping[lc]}
             if lc in ';:': return {"type": "semicolon_colon"}
@@ -460,10 +552,7 @@ class MismatchChecker:
             orig_len = len(orig.strip())
             trans_len = len(trans.strip())
             too_short_threshold = self.thresholds.get("length_ratio_too_short", 0.45)
-            if orig_len < 80:
-                length_flag = trans_len > orig_len * 1.75
-            else:
-                length_flag = trans_len > orig_len * 2.5
+            length_flag = self._dynamic_length_mismatch(orig.strip(), trans.strip())
             if not length_flag and orig_len >= 8:
                 length_flag = trans_len < orig_len * too_short_threshold
             if length_flag:
@@ -551,7 +640,7 @@ class MismatchChecker:
             t = t.rstrip()
             if not t: return {"type": "quote_only"}
             lc = t[-1]
-            if lc == '.' and t.endswith('...'): return {"type": "ellipsis"}
+            if lc == '.' and _is_ellipsis_ending(t): return {"type": "ellipsis"}
             mapping = {'.': 'period', ',': 'comma', '!': 'exclamation', '?': 'question', '…': 'ellipsis'}
             if lc in mapping: return {"type": mapping[lc]}
             if lc in ';:': return {"type": "semicolon_colon"}
@@ -770,7 +859,7 @@ class MismatchChecker:
         return errors
 
     def _parse_inline_structure(self, text: str) -> Dict:
-        clean_text = re.sub(r'</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|<ps>', '', text)
+        clean_text = re.sub(r'</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|</?ps>', '', text)
         total_length = len(clean_text)
         if total_length == 0:
             return {}
@@ -780,7 +869,7 @@ class MismatchChecker:
         current_pos = 0
         content_accumulator: Dict[str, str] = {}
 
-        pattern = r'(<p_(\d{2})>|</p_(\d{2})>|<id_\d{2}>|<nt_\d{2}/>|<ps>|[^<]+|<[^>]*>)'
+        pattern = r'(<p_(\d{2})>|</p_(\d{2})>|<id_\d{2}>|<nt_\d{2}/>|</?ps>|[^<]+|<[^>]*>)'
 
         for match in re.finditer(pattern, text):
             token = match.group(0)
@@ -816,7 +905,8 @@ class MismatchChecker:
 
             elif (token.startswith('<id_')
                   or token.startswith('<nt_')
-                  or token == '<ps>'):
+                  or token == '<ps>'
+                  or token == '</ps>'):
                 pass
 
             else:
@@ -829,7 +919,7 @@ class MismatchChecker:
 
     def _get_self_closing_tag_positions(self, text: str, tag_regex: str) -> Dict[str, float]:
         ALL_PLACEHOLDER = re.compile(
-            r'</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|<ps>'
+            r'</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|</?ps>'
         )
         TARGET_TAG = re.compile(tag_regex)
 
@@ -842,7 +932,7 @@ class MismatchChecker:
         clean_pos = 0
 
         token_re = re.compile(
-            r'</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|<ps>|[^<]+|<[^>]*>'
+            r'</?p_\d{2}>|<id_\d{2}>|<nt_\d{2}/>|</?ps>|[^<]+|<[^>]*>'
         )
 
         for m in token_re.finditer(text):
@@ -953,8 +1043,12 @@ class MismatchChecker:
         return False, error_details
 
 class FormattingSynchronizer:
-    def __init__(self, file_type: str):
+    def __init__(self, file_type: str, quote_style: str = 'neutral'):
         self.file_type = file_type
+        self.quote_style = quote_style
+        pair = QUOTE_STYLE_OPTIONS.get(quote_style, ('"', '"'))
+        self._quote_open: str = pair[0]
+        self._quote_close: str = pair[1]
 
     def sync_formatting(
         self,
@@ -1009,10 +1103,10 @@ class FormattingSynchronizer:
         text_stripped = text.strip()
         leading_ws  = text[:len(text) - len(text.lstrip())]
         trailing_ws = text[len(text.rstrip()):]
-    
+
         has_translation_open  = re.match(r'^<translation>', text_stripped, re.IGNORECASE)
         has_translation_close = re.search(r'</translation>$', text_stripped, re.IGNORECASE)
-    
+
         if has_translation_open and has_translation_close:
             text_without_tags = re.sub(
                 r'^<translation>\s*|\s*</translation>$',
@@ -1021,108 +1115,80 @@ class FormattingSynchronizer:
                 flags=re.IGNORECASE
             ).strip()
             return leading_ws + text_without_tags + trailing_ws
-    
-        KNOWN_INTERNAL_TAGS = re.compile(
-            r'^<(p_\d+)[\s/>]', re.IGNORECASE
-        )
-    
-        unknown_opening_tag = re.match(r'^<\s*([A-Za-z_][A-Za-z0-9_-]*)[^>]*>', text_stripped)
-        if unknown_opening_tag and not KNOWN_INTERNAL_TAGS.match(text_stripped):
-            closing_tag = re.compile(rf'<\/{re.escape(unknown_opening_tag.group(1))}>$')
-            if closing_tag.search(text_stripped):
-                text_without_tags = re.sub(
-                    rf'^<{re.escape(unknown_opening_tag.group(1))}>\s*|\s*</{re.escape(unknown_opening_tag.group(1))}>$',
-                    '',
-                    text_stripped,
-                    flags=re.IGNORECASE
-                ).strip()
-                return leading_ws + text_without_tags + trailing_ws
-    
+
         if '</text_to_translate>' in text_stripped:
             text_stripped = text_stripped.replace('</text_to_translate>', '')
             logger.debug("Removed rogue </text_to_translate> tag")
-    
+
         if re.search(r'</id_\d{2}>', text_stripped):
             text_stripped = re.sub(r'</id_\d{2}>', '', text_stripped).strip()
             logger.debug("Removed spurious </id_XX> closing tag(s)")
-    
+
         OPENING_TAGS = [
             '<translated>',
             '<TRANSLATED>',
             '<translation>',
             '<TRANSLATION>',
         ]
-    
+
         CLOSING_TAGS = [
             '</translated>',
             '</TRANSLATED>',
             '</translation>',
             '</TRANSLATION>',
         ]
-    
+
         has_opening_tag    = False
         opening_tag_length = 0
-    
+
         for tag in OPENING_TAGS:
             if text_stripped.startswith(tag):
                 has_opening_tag    = True
                 opening_tag_length = len(tag)
                 break
-    
+
         has_closing_tag    = False
         closing_tag_length = 0
-    
+
         for tag in CLOSING_TAGS:
             if text_stripped.endswith(tag):
                 has_closing_tag    = True
                 closing_tag_length = len(tag)
                 break
-    
+
         if has_opening_tag and has_closing_tag:
             text_without_tags = text_stripped[opening_tag_length:-closing_tag_length].strip()
             return leading_ws + text_without_tags + trailing_ws
-    
+
         if has_opening_tag and not has_closing_tag:
             text_without_opening = text_stripped[opening_tag_length:].strip()
             return leading_ws + text_without_opening + trailing_ws
-    
+
         if not has_opening_tag and has_closing_tag:
             text_without_closing = text_stripped[:-closing_tag_length].strip()
             return leading_ws + text_without_closing + trailing_ws
-    
+
+        cleaned = re.sub(r'</?(?:translated|translation)>', '', text_stripped, flags=re.IGNORECASE)
+        if cleaned != text_stripped:
+            logger.debug("Removed stray translated/translation tag(s) from within text")
+            text_stripped = cleaned.strip()
+
         return leading_ws + text_stripped + trailing_ws
 
     def normalize_quotes(self, text: str) -> str:
-        DOUBLE_QUOTES_VARIANTS = [
-            '\u201C',
-            '\u201D',
-            '\u201E',
-            '\u201F',
-            '\u00AB',
-            '\u00BB',
-            '\u301D',
-            '\u301E',
-            '\u301F',
-            '\uFF02',
-        ]
-
         SINGLE_QUOTES_VARIANTS = [
-            '\u2018',
-            '\u2019',
-            '\u201A',
-            '\u201B',
+            '\u2018', '\u2019', '\u201A', '\u201B',
             '\u2032',
-            '\u2039',
-            '\u203A',
+            '\u275B', '\u275C',
         ]
 
         result = text
-
-        for variant in DOUBLE_QUOTES_VARIANTS:
-            result = result.replace(variant, '"')
-
         for variant in SINGLE_QUOTES_VARIANTS:
             result = result.replace(variant, "'")
+
+        open_char = self._quote_open
+        close_char = self._quote_close
+        result = apply_quote_style_to_text(result, open_char, close_char)
 
         return result
 
@@ -1136,6 +1202,13 @@ class FormattingSynchronizer:
 
         if not is_all_caps:
             return translated
+
+        if len(orig_letters_only) > 100:
+            trans_letters = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', translated)
+            if trans_letters:
+                upper_ratio = sum(1 for c in trans_letters if c.isupper()) / len(trans_letters)
+                if upper_ratio < 0.5:
+                    return translated
 
         result = []
         for char in translated:
@@ -1170,6 +1243,8 @@ class FormattingSynchronizer:
     def sync_formatting_epub(self, original: str, translated: str) -> str:
         result = translated
 
+        result = self.sync_dialogue_dashes_epub(original, result)
+
         result = self.sync_quotes(original, result)
 
         result = self.sync_leading_whitespace_epub(original, result)
@@ -1195,50 +1270,87 @@ class FormattingSynchronizer:
         orig_lines = original.split('\n')
         trans_lines = translated.split('\n')
 
-        orig_has_dash = []
-        for line in orig_lines:
-            line_stripped = line.lstrip()
-            has_dash = line_stripped.startswith('- ')
-            orig_has_dash.append(has_dash)
+        def get_dialogue_dash(text):
+            stripped = text.lstrip()
+            for dash in ['\u2014 ', '\u2013 ', '- ']:
+                if stripped.startswith(dash):
+                    return dash
+            return None
 
-        dash_count = sum(orig_has_dash)
+        orig_dash_info = [get_dialogue_dash(line) for line in orig_lines]
+        dash_count = sum(1 for d in orig_dash_info if d is not None)
 
         if dash_count < 2:
             return translated
 
         if len(orig_lines) != len(trans_lines):
             if dash_count == len(orig_lines):
+                dominant_dash = '\u2014 '
+                for d in orig_dash_info:
+                    if d is not None:
+                        dominant_dash = d
+                        break
                 result_lines = []
                 for trans_line in trans_lines:
                     trans_stripped = trans_line.lstrip()
                     leading_ws = trans_line[:len(trans_line) - len(trans_stripped)]
-
-                    if trans_stripped.startswith('- '):
+                    if get_dialogue_dash(trans_line) is not None:
                         result_lines.append(trans_line)
                     else:
-                        result_lines.append(leading_ws + '- ' + trans_stripped)
-
+                        result_lines.append(leading_ws + dominant_dash + trans_stripped)
                 return '\n'.join(result_lines)
             else:
                 return translated
 
         result_lines = []
         for i, (orig_line, trans_line) in enumerate(zip(orig_lines, trans_lines)):
+            orig_dash = orig_dash_info[i]
             trans_stripped = trans_line.lstrip()
             leading_ws = trans_line[:len(trans_line) - len(trans_stripped)]
+            trans_dash = get_dialogue_dash(trans_line)
 
-            should_have_dash = orig_has_dash[i]
-            has_dash = trans_stripped.startswith('- ')
-
-            if should_have_dash and not has_dash:
-                result_lines.append(leading_ws + '- ' + trans_stripped)
-            elif not should_have_dash and has_dash:
-                trans_no_dash = trans_stripped[2:]
-                result_lines.append(leading_ws + trans_no_dash)
+            if orig_dash is not None and trans_dash is None:
+                result_lines.append(leading_ws + orig_dash + trans_stripped)
+            elif orig_dash is None and trans_dash is not None:
+                result_lines.append(leading_ws + trans_stripped[len(trans_dash):])
             else:
                 result_lines.append(trans_line)
 
         return '\n'.join(result_lines)
+
+    def sync_dialogue_dashes_epub(self, original: str, translated: str) -> str:
+        def get_dialogue_dash(text):
+            stripped = text.lstrip()
+            for dash in ['\u2014 ', '\u2013 ', '- ']:
+                if stripped.startswith(dash):
+                    return dash
+            return None
+
+        def sync_single_line_dash(orig_line, trans_line):
+            orig_dash = get_dialogue_dash(orig_line)
+            trans_stripped = trans_line.lstrip()
+            leading_ws = trans_line[:len(trans_line) - len(trans_stripped)]
+            trans_dash = get_dialogue_dash(trans_line)
+
+            if orig_dash and not trans_dash:
+                return leading_ws + orig_dash + trans_stripped
+            elif not orig_dash and trans_dash:
+                return leading_ws + trans_stripped[len(trans_dash):]
+            return trans_line
+
+        if '\n' in original or '\n' in translated:
+            orig_lines = original.split('\n')
+            trans_lines = translated.split('\n')
+
+            if len(orig_lines) != len(trans_lines):
+                return sync_single_line_dash(original, translated)
+
+            result_lines = []
+            for orig_line, trans_line in zip(orig_lines, trans_lines):
+                result_lines.append(sync_single_line_dash(orig_line, trans_line))
+            return '\n'.join(result_lines)
+
+        return sync_single_line_dash(original, translated)
 
     def sync_leading_whitespace_epub(self, original: str, translated: str) -> str:
         orig_leading = re.match(r'^([ \t]*)', original)
@@ -1325,6 +1437,9 @@ class FormattingSynchronizer:
             if not text_no_quotes:
                 return None, has_double, has_apostrophe
 
+            if _is_ellipsis_ending(text_no_quotes):
+                return 'ellipsis', has_double, has_apostrophe
+
             last_char = text_no_quotes[-1]
 
             punct_type = None
@@ -1338,6 +1453,10 @@ class FormattingSynchronizer:
                 punct_type = 'question'
             elif last_char == '…':
                 punct_type = 'ellipsis'
+            elif last_char == ';':
+                punct_type = 'semicolon'
+            elif last_char == ':':
+                punct_type = 'colon'
 
             return punct_type, has_double, has_apostrophe
 
@@ -1437,7 +1556,7 @@ class FormattingSynchronizer:
                 return translated
             elif trans_punct == 'comma':
                 return replace_punctuation_local(translated, 'comma', 'period')
-            elif trans_punct in ['exclamation', 'question', 'ellipsis']:
+            elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
                 return translated
             else:
                 return add_punctuation_local(translated, 'period')
@@ -1447,12 +1566,12 @@ class FormattingSynchronizer:
                 return translated
             elif trans_punct == 'period':
                 return replace_punctuation_local(translated, 'period', 'comma')
-            elif trans_punct in ['exclamation', 'question', 'ellipsis']:
+            elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
                 return translated
             else:
                 return add_punctuation_local(translated, 'comma')
 
-        elif orig_punct in ['exclamation', 'question', 'ellipsis']:
+        elif orig_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
             return translated
 
         else:
@@ -1460,7 +1579,7 @@ class FormattingSynchronizer:
                 return remove_punctuation_local(translated, 'period')
             elif trans_punct == 'comma':
                 return remove_punctuation_local(translated, 'comma')
-            elif trans_punct in ['exclamation', 'question', 'ellipsis']:
+            elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
                 return translated
             else:
                 return translated
@@ -1471,10 +1590,15 @@ class FormattingSynchronizer:
         if not orig_letters_only:
             return translated
 
-        is_all_caps = orig_letters_only.isupper()
-
-        if not is_all_caps:
+        if not orig_letters_only.isupper():
             return translated
+
+        if len(orig_letters_only) > 100:
+            trans_letters = re.sub(r'[^a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]', '', translated)
+            if trans_letters:
+                upper_ratio = sum(1 for c in trans_letters if c.isupper()) / len(trans_letters)
+                if upper_ratio < 0.5:
+                    return translated
 
         result = []
         for char in translated:
@@ -1522,9 +1646,11 @@ class FormattingSynchronizer:
             leading_ws = trans_line[:len(trans_line) - len(trans_stripped)]
 
             dash_prefix = ''
-            if trans_stripped.startswith('- '):
-                dash_prefix = '- '
-                trans_stripped = trans_stripped[2:].lstrip()
+            for dash in ['\u2014 ', '\u2013 ', '- ']:
+                if trans_stripped.startswith(dash):
+                    dash_prefix = dash
+                    trans_stripped = trans_stripped[len(dash):].lstrip()
+                    break
 
             trans_no_quotes = re.sub(f'^{ALL_QUOTES}+', '', trans_stripped)
             quote_prefix = trans_stripped[:len(trans_stripped) - len(trans_no_quotes)]
@@ -1576,7 +1702,7 @@ class FormattingSynchronizer:
                     return trans_line
                 elif trans_punct == 'comma':
                     return replace_punctuation(trans_line, 'comma', 'period')
-                elif trans_punct in ['exclamation', 'question', 'ellipsis']:
+                elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
                     return trans_line
                 else:
                     return add_punctuation(trans_line, 'period')
@@ -1586,12 +1712,12 @@ class FormattingSynchronizer:
                     return trans_line
                 elif trans_punct == 'period':
                     return replace_punctuation(trans_line, 'period', 'comma')
-                elif trans_punct in ['exclamation', 'question', 'ellipsis']:
+                elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
                     return trans_line
                 else:
                     return add_punctuation(trans_line, 'comma')
 
-            elif orig_punct in ['exclamation', 'question', 'ellipsis']:
+            elif orig_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
                 return trans_line
 
             else:
@@ -1599,7 +1725,7 @@ class FormattingSynchronizer:
                     return remove_punctuation(trans_line, 'period')
                 elif trans_punct == 'comma':
                     return remove_punctuation(trans_line, 'comma')
-                elif trans_punct in ['exclamation', 'question', 'ellipsis']:
+                elif trans_punct in ['exclamation', 'question', 'ellipsis', 'semicolon', 'colon']:
                     return trans_line
                 else:
                     return trans_line
@@ -1623,6 +1749,13 @@ class FormattingSynchronizer:
         return sync_single_line_ending(original, translated)
 
     def sync_quotes(self, original: str, translated: str) -> str:
+        q_open = self._quote_open
+        q_close = self._quote_close
+
+        def _count_active_quotes(text: str) -> int:
+            active_chars = {'"', q_open, q_close}
+            return sum(1 for ch in text if ch in active_chars)
+
         def process_single_line(orig_line, trans_line):
             orig_has_start = has_quote_at_start(orig_line)
             orig_has_end = has_quote_at_end(orig_line)
@@ -1631,8 +1764,8 @@ class FormattingSynchronizer:
             trans_has_quote_start = bool(trans_stripped and re.match(ALL_QUOTES, trans_stripped))
             trans_has_dash_start = bool(trans_stripped and (
                 trans_stripped.startswith('- ') or
-                trans_stripped.startswith('– ') or
-                trans_stripped.startswith('— ')
+                trans_stripped.startswith('\u2013 ') or
+                trans_stripped.startswith('\u2014 ')
             ))
             trans_has_start = trans_has_quote_start or trans_has_dash_start
 
@@ -1640,26 +1773,28 @@ class FormattingSynchronizer:
 
             result = trans_line
 
-            current_quote_count = count_double_quotes(trans_line)
+            orig_quote_count = _count_active_quotes(orig_line)
+            orig_quote_parity_odd = (orig_quote_count % 2 != 0)
+            current_quote_count = _count_active_quotes(trans_line)
             is_even = (current_quote_count % 2 == 0)
 
             need_start = orig_has_start and not trans_has_start
             need_end = orig_has_end and not trans_has_end
 
             if need_start and need_end:
-                result = add_quote_to_start(result)
-                result = add_quote_to_end(result)
+                result = add_quote_to_start(result, q_open)
+                result = add_quote_to_end(result, q_close)
                 trans_has_start = True
                 trans_has_end = True
             elif need_start:
                 if orig_has_start and trans_has_dash_start and not trans_has_quote_start:
                     pass
-                elif not is_even:
-                    result = add_quote_to_start(result)
+                elif not is_even or orig_quote_parity_odd:
+                    result = add_quote_to_start(result, q_open)
                     trans_has_start = True
             elif need_end:
-                if not is_even:
-                    result = add_quote_to_end(result)
+                if not is_even or orig_quote_parity_odd:
+                    result = add_quote_to_end(result, q_close)
                     trans_has_end = True
             else:
                 pass
@@ -1678,17 +1813,17 @@ class FormattingSynchronizer:
                 trans_has_dash = contains_dash(result)
 
                 if not orig_has_dash and trans_has_dash:
-                    total_double_quote_count = count_double_quotes(result)
+                    total_double_quote_count = _count_active_quotes(result)
                     external_quote_count = count_external_quotes(result)
 
                     if total_double_quote_count % 2 != 0 and external_quote_count == 1:
                         result_stripped = result.lstrip()
-                        if result_stripped and re.match(DOUBLE_QUOTES, result_stripped):
+                        if result_stripped and re.match(ALL_QUOTES, result_stripped):
                             if (total_double_quote_count - 1) % 2 == 0:
                                 result = remove_quote_from_start(result, force=True)
                         else:
                             result_stripped_end = result.rstrip()
-                            if result_stripped_end and re.match(DOUBLE_QUOTES, result_stripped_end[-1]):
+                            if result_stripped_end and re.match(ALL_QUOTES, result_stripped_end[-1]):
                                 if (total_double_quote_count - 1) % 2 == 0:
                                     result = remove_quote_from_end(result, force=True)
 
@@ -1700,7 +1835,7 @@ class FormattingSynchronizer:
                 trans_lines = translated.split('\n')
 
                 if len(orig_lines) != len(trans_lines):
-                    return process_single_line(original, translated)
+                    return translated
 
                 result_lines = []
                 for orig_line, trans_line in zip(orig_lines, trans_lines):
@@ -1736,6 +1871,8 @@ class FormattingSynchronizer:
 
     def sync_formatting_legacy_epub(self, original: str, translated: str) -> str:
         result = translated
+
+        result = self.sync_dialogue_dashes_epub(original, result)
 
         result = self.sync_quotes(original, result)
 
@@ -1774,4 +1911,3 @@ class FormattingSynchronizer:
         cleaned = re.sub(r'  +', ' ', cleaned)
 
         return cleaned
-
