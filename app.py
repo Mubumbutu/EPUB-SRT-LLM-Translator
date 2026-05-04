@@ -17,7 +17,7 @@ from app_utils import (
 )
 from deep_translator import GoogleTranslator
 from epub_creator_lxml import EPUBCreatorLxml
-from file_processors import FileProcessorFactory
+from file_processors import EPUBWriter, FB2Writer, DOCXWriter, FileProcessorFactory
 from format_alignment import (
     FormatAlignmentEngine,
     INLINE_TRANSFER_TAGS,
@@ -28,13 +28,16 @@ from format_alignment import (
     MODELS_SUBDIR,
 )
 from formatting import (
-    ALL_QUOTES_CHARS,
-    DOUBLE_QUOTES_CHARS,
     FormattingSynchronizer,
     MismatchChecker,
+    QUOTE_STYLE_LABELS,
+    QUOTE_STYLE_OPTIONS,
+    ALL_QUOTES_CHARS,
+    DOUBLE_QUOTES_CHARS,
     SINGLE_QUOTES_CHARS,
+    apply_quote_style_to_text,
 )
-from epub_preview import EPUBPreviewEngine, EPUBPreviewToolbar, EPUBReaderWindow
+from preview import EPUBPreviewEngine, EPUBPreviewToolbar, EPUBReaderWindow, GenericReaderWindow
 from PyQt6.QtCore import pyqtSignal, Qt, QThread, QTimer, QUrl
 from PyQt6.QtGui import QColor, QCursor, QIcon, QPalette
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -105,7 +108,9 @@ class TranslationWorkerThread(QThread):
         context_after,
         temperature,
         auto_fix_manager=None,
-        mismatch_checker=None
+        mismatch_checker=None,
+        top_p=None,
+        top_k=None
     ):
         super().__init__()
         self.orchestrator = orchestrator
@@ -115,6 +120,8 @@ class TranslationWorkerThread(QThread):
         self.temperature = temperature
         self.auto_fix_manager = auto_fix_manager
         self.mismatch_checker = mismatch_checker
+        self.top_p = top_p
+        self.top_k = top_k
         self._cancelled = False
 
     def request_cancel(self):
@@ -144,7 +151,9 @@ class TranslationWorkerThread(QThread):
                 temperature=self.temperature,
                 auto_fix_manager=self.auto_fix_manager,
                 mismatch_checker=self.mismatch_checker,
-                progress_callback=self._on_retry_attempt
+                progress_callback=self._on_retry_attempt,
+                top_p=self.top_p,
+                top_k=self.top_k
             )
 
             idx = self.fragment.get('index', 0)
@@ -177,7 +186,9 @@ class TranslationBatchWorkerThread(QThread):
         auto_fix_manager=None,
         mismatch_checker=None,
         batcher=None,
-        batch_hint_template=""
+        batch_hint_template="",
+        top_p=None,
+        top_k=None
     ):
         super().__init__()
         self.orchestrator = orchestrator
@@ -190,6 +201,8 @@ class TranslationBatchWorkerThread(QThread):
         self.mismatch_checker = mismatch_checker
         self.batcher = batcher
         self.batch_hint_template = batch_hint_template
+        self.top_p = top_p
+        self.top_k = top_k
         self._cancelled = False
 
     def request_cancel(self):
@@ -239,7 +252,9 @@ class TranslationBatchWorkerThread(QThread):
                     response = self.orchestrator.llm_client.translate(
                         prompt,
                         self.temperature,
-                        self.orchestrator.timeout_seconds
+                        self.orchestrator.timeout_seconds,
+                        top_p=self.top_p,
+                        top_k=self.top_k
                     )
 
                     if self._cancelled:
@@ -397,12 +412,58 @@ class TXTCreator(QThread):
 
     def run(self):
         try:
-            with open(self.output_path, 'w', encoding='utf-8') as f:
-                for i, para in enumerate(self.paragraphs):
-                    text = para['translated_text'] if para['is_translated'] else para['original_text']
-                    f.write(text)
-                    if i < len(self.paragraphs) - 1:
-                        f.write('\n\n')
+            import re as _re
+            from collections import OrderedDict
+
+            is_subtitle = any(p.get('element_type') == 'subtitle_line' for p in self.paragraphs)
+
+            if is_subtitle:
+                blocks = OrderedDict()
+                for para in self.paragraphs:
+                    bid = para.get('txt_subtitle_block_id', 0)
+                    if bid not in blocks:
+                        blocks[bid] = {
+                            'start': para.get('txt_subtitle_start', 0),
+                            'end': para.get('txt_subtitle_end', 0),
+                            'lines': {},
+                        }
+                    line_index = para.get('txt_subtitle_line_index', 0)
+                    if para.get('is_translated') and para.get('aligned_translated_html'):
+                        text = _re.sub(r'<[^>]+>', '', para['aligned_translated_html'])
+                        text = _re.sub(r'\s+', ' ', text).strip()
+                    else:
+                        text = para['translated_text'] if para['is_translated'] else para['original_text']
+                        text = _re.sub(r'</?id_\d{2}>', '', text)
+                        text = _re.sub(r'</?p_\d{2}>', '', text)
+                        text = _re.sub(r'<nt_\d{2}/>', '', text)
+                        text = _re.sub(r'  +', ' ', text).strip()
+                    blocks[bid]['lines'][line_index] = text
+
+                with open(self.output_path, 'w', encoding='utf-8') as f:
+                    for bid, block_data in blocks.items():
+                        start = block_data['start']
+                        end = block_data['end']
+                        sorted_lines = [block_data['lines'][i] for i in sorted(block_data['lines'])]
+                        joined = '|'.join(sorted_lines)
+                        f.write(f'[{start}][{end}]{joined}\n')
+
+            else:
+                with open(self.output_path, 'w', encoding='utf-8') as f:
+                    for i, para in enumerate(self.paragraphs):
+                        if para.get('is_translated') and para.get('aligned_translated_html'):
+                            text = _re.sub(r'<[^>]+>', '', para['aligned_translated_html'])
+                            text = _re.sub(r'\s+', ' ', text).strip()
+                        else:
+                            text = para['translated_text'] if para['is_translated'] else para['original_text']
+                            text = _re.sub(r'</?id_\d{2}>', '', text)
+                            text = _re.sub(r'</?p_\d{2}>', '', text)
+                            text = _re.sub(r'<nt_\d{2}/>', '', text)
+                            text = _re.sub(r'  +', ' ', text).strip()
+                        if not text:
+                            continue
+                        f.write(text)
+                        if i < len(self.paragraphs) - 1:
+                            f.write('\n\n')
 
             self.finished.emit(self.output_path, False)
         except Exception as e:
@@ -603,7 +664,6 @@ class TranslatorApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("EPUB and SRT Translator with LLM by Mubumbutu")
         self.setWindowIcon(QIcon("icon.ico"))
-
         self.resize(1500, 900)
         self.setMinimumSize(1200, 700)
 
@@ -613,15 +673,13 @@ class TranslatorApp(QMainWindow):
         self.translation_orchestrator: Optional[TranslationOrchestrator] = None
         self.prompt_manager: PromptManager = PromptManager()
         self.current_prompts_cache: Dict[str, Dict[str, str]] = {}
-
         self.paragraphs: List[Dict] = []
         self.para_to_row_map = {}
         self.row_to_para_map = {}
         self.original_file_path: Optional[str] = None
         self.file_type: Optional[str] = None
-
+        self.source_format: Optional[str] = None
         self.app_settings = AppSettingsManager.load_settings()
-
         self.translation_queue: List[int] = []
         self.current_translation_idx: Optional[int] = None
         self.current_auto_fix_attempt: int = 0
@@ -630,17 +688,15 @@ class TranslatorApp(QMainWindow):
         self.translation_cancelled: bool = False
         self.last_checked_row: Optional[int] = None
         self.is_session_loaded: bool = False
-
         self._eta_chars_done: int = 0
         self._eta_chars_total: int = 0
         self._eta_session_start: Optional[float] = None
-        self._eta_recent_times: List[float] = []
-
+        self._eta_recent_times: List[tuple] = []
+        self._eta_fragment_start: Optional[float] = None
         self.translation_timer = QTimer()
         self.translation_timer.timeout.connect(self.update_translation_time)
         self.translation_start_time: Optional[float] = None
         self.current_fragment_index: Optional[int] = None
-
         self.current_worker: Optional[QThread] = None
         self._alignment_worker: Optional[AlignmentWorkerThread] = None
         self._alignment_cancelled: bool = False
@@ -649,16 +705,17 @@ class TranslatorApp(QMainWindow):
         self.epub_creator: Optional[EPUBCreatorLxml] = None
         self.srt_creator: Optional[SRTCreator] = None
         self.txt_creator: Optional[TXTCreator] = None
+        self.pdf_creator = None
+
+        self._hard_cancel_mode: bool = False
 
         self._download_done_signal.connect(self._on_download_done_slot)
-
         self._preview_engine = EPUBPreviewEngine()
         self._preview_show_original_ids: set = set()
         self._preview_dark_mode: bool = False
         self._reader_window: EPUBReaderWindow = None
 
         self.init_ui()
-
         self._initialize_components()
 
     def _get_models_dir(self) -> str:
@@ -666,6 +723,16 @@ class TranslatorApp(QMainWindow):
         return os.path.join(app_dir, MODELS_SUBDIR)
 
     def _initialize_components(self):
+        raw_style = self.app_settings.get('quote_style', 'neutral')
+        canonical = self._normalize_quote_style(raw_style)
+        if canonical != raw_style:
+            self.app_settings['quote_style'] = canonical
+            if hasattr(self, 'quote_style_combo'):
+                for i in range(self.quote_style_combo.count()):
+                    if self.quote_style_combo.itemData(i) == canonical:
+                        self.quote_style_combo.setCurrentIndex(i)
+                        break
+
         if self.file_type:
             self.mismatch_checker = MismatchChecker(
                 self.file_type,
@@ -675,12 +742,19 @@ class TranslatorApp(QMainWindow):
             self.mismatch_checker = None
 
         if self.file_type:
-            self.formatting_sync = FormattingSynchronizer(self.file_type)
+            self.formatting_sync = FormattingSynchronizer(
+                self.file_type,
+                quote_style=self.app_settings.get('quote_style', 'neutral')
+            )
         else:
             self.formatting_sync = None
 
         if hasattr(self, 'mismatch_check_checkboxes'):
             self._on_mismatch_check_toggled()
+
+    def _normalize_quote_style(self, style: str) -> str:
+        _aliases = {'swiss': 'french', 'russian': 'french'}
+        return _aliases.get(style, style)
 
     def init_ui(self):
         translator_widget = QWidget()
@@ -1453,6 +1527,44 @@ class TranslatorApp(QMainWindow):
         self.temperature_spinbox.setStyleSheet(SPINBOX_STYLE)
         param_pair("🌡  Temperature:", self.temperature_spinbox)
 
+        sep_v_top_p = QFrame()
+        sep_v_top_p.setFrameShape(QFrame.Shape.VLine)
+        sep_v_top_p.setStyleSheet("background-color: #333; border: none; max-width: 1px;")
+        params_group_layout.addWidget(sep_v_top_p)
+
+        self.top_p_spinbox = QDoubleSpinBox()
+        self.top_p_spinbox.setRange(0.0, 1.0)
+        self.top_p_spinbox.setSingleStep(0.05)
+        self.top_p_spinbox.setValue(0.0)
+        self.top_p_spinbox.setFixedWidth(78)
+        self.top_p_spinbox.setSpecialValueText("Off")
+        self.top_p_spinbox.setStyleSheet(SPINBOX_STYLE)
+        self.top_p_spinbox.setToolTip(
+            "Top-P (nucleus sampling): limits the token pool to the top tokens\n"
+            "whose cumulative probability reaches P.\n"
+            "Range: 0.01–1.0. Set to 'Off' (0.0) to disable."
+        )
+        param_pair("Top P:", self.top_p_spinbox)
+
+        sep_v_top_k = QFrame()
+        sep_v_top_k.setFrameShape(QFrame.Shape.VLine)
+        sep_v_top_k.setStyleSheet("background-color: #333; border: none; max-width: 1px;")
+        params_group_layout.addWidget(sep_v_top_k)
+
+        self.top_k_spinbox = QSpinBox()
+        self.top_k_spinbox.setRange(0, 500)
+        self.top_k_spinbox.setSingleStep(10)
+        self.top_k_spinbox.setValue(0)
+        self.top_k_spinbox.setFixedWidth(78)
+        self.top_k_spinbox.setSpecialValueText("Off")
+        self.top_k_spinbox.setStyleSheet(SPINBOX_STYLE)
+        self.top_k_spinbox.setToolTip(
+            "Top-K: limits sampling to the K most likely next tokens.\n"
+            "Higher values allow more variety; lower values make output more focused.\n"
+            "Set to 'Off' (0) to disable."
+        )
+        param_pair("Top K:", self.top_k_spinbox)
+
         sep_v1 = QFrame()
         sep_v1.setFrameShape(QFrame.Shape.VLine)
         sep_v1.setStyleSheet("background-color: #333; border: none; max-width: 1px;")
@@ -1502,6 +1614,7 @@ class TranslatorApp(QMainWindow):
             "Use for instruct-only models (e.g., Gemma) or to avoid Channel Errors."
         )
         self.single_prompt_checkbox.setStyleSheet(CHECKBOX_STYLE)
+        self.single_prompt_checkbox.stateChanged.connect(self._on_single_prompt_toggled)
         editor_header_layout.addWidget(self.single_prompt_checkbox)
 
         self.json_payload_checkbox = QCheckBox("JSON Payload mode")
@@ -1937,6 +2050,16 @@ class TranslatorApp(QMainWindow):
         self.ollama_model_edit.setPlaceholderText("e.g., llama3.2:3b")
         self.ollama_model_edit.setStyleSheet(INPUT_STYLE)
         engine_form.addRow(self.ollama_model_label, self.ollama_model_edit)
+        
+        self.ollama_server_url_label = form_label("Ollama Server URL:")
+        self.ollama_server_url_edit = QLineEdit()
+        self.ollama_server_url_edit.setPlaceholderText("e.g., http://localhost:11434")
+        self.ollama_server_url_edit.setStyleSheet(INPUT_STYLE)
+        self.ollama_server_url_edit.setToolTip(
+            "Custom base URL for Ollama server.\n"
+            "Leave empty to use the default: http://localhost:11434"
+        )
+        engine_form.addRow(self.ollama_server_url_label, self.ollama_server_url_edit)
 
         self.openrouter_api_key_label = form_label("Openrouter API Key:")
         self.openrouter_api_key_edit = QLineEdit()
@@ -2075,6 +2198,40 @@ class TranslatorApp(QMainWindow):
         outer_layout.addWidget(
             make_collapsible("📝  Paragraph Structure Restoration", para_content,
                              expanded=False, color_scheme="green")
+        )
+
+        quote_style_content = QWidget()
+        quote_style_content.setStyleSheet("background: transparent;")
+        quote_style_outer_layout = QVBoxLayout(quote_style_content)
+        quote_style_outer_layout.setContentsMargins(0, 0, 0, 0)
+        quote_style_outer_layout.setSpacing(10)
+
+        qs_label = QLabel("Quotation mark style applied to all translated fragments:")
+        qs_label.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+        qs_label.setWordWrap(True)
+        quote_style_outer_layout.addWidget(qs_label)
+
+        self.quote_style_combo = QComboBox()
+        self.quote_style_combo.setStyleSheet(COMBO_STYLE)
+        saved_quote_style = self.app_settings.get('quote_style', 'neutral')
+        for key, label in QUOTE_STYLE_LABELS:
+            self.quote_style_combo.addItem(label, key)
+            if key == saved_quote_style:
+                self.quote_style_combo.setCurrentIndex(self.quote_style_combo.count() - 1)
+        quote_style_outer_layout.addWidget(self.quote_style_combo)
+
+        qs_note = QLabel(
+            "Applies on Save Settings \u2014 all already-translated fragments are updated automatically.\n"
+            "Fragments edited manually in the Translation field are skipped.\n"
+            "New translations use the selected style during processing."
+        )
+        qs_note.setStyleSheet("color: #666666; font-size: 11px;")
+        qs_note.setWordWrap(True)
+        quote_style_outer_layout.addWidget(qs_note)
+
+        outer_layout.addWidget(
+            make_collapsible("\u275d  Quote Style", quote_style_content,
+                             expanded=False, color_scheme="blue")
         )
 
         mismatch_content = QWidget()
@@ -2599,6 +2756,7 @@ class TranslatorApp(QMainWindow):
         self.llm_choice_combo.setCurrentText(current_llm)
         self.server_url_edit.setText(self.app_settings.get("server_url", ""))
         self.ollama_model_edit.setText(self.app_settings.get("ollama_model_name", ""))
+        self.ollama_server_url_edit.setText(self.app_settings.get("ollama_server_url", ""))
         self.openrouter_api_key_edit.setText(self.app_settings.get("openrouter_api_key", ""))
         self.openrouter_model_edit.setText(self.app_settings.get("openrouter_model_name", ""))
         self.deepl_free_api_key_edit.setText(self.app_settings.get("deepl_free_api_key", ""))
@@ -2618,27 +2776,52 @@ class TranslatorApp(QMainWindow):
             self,
             "Open File",
             "",
-            "Files (*.epub *.srt *.txt);;EPUB Files (*.epub);;SRT Files (*.srt);;Text Files (*.txt)"
+            "Supported files (*.epub *.azw3 *.mobi *.azw *.srt *.txt *.pdf *.fb2 *.docx);;"
+            "EPUB Files (*.epub);;AZW3 Files (*.azw3);;Kindle Files (*.mobi *.azw);;"
+            "SRT Files (*.srt);;Text Files (*.txt);;PDF Files (*.pdf);;"
+            "FB2 Files (*.fb2);;Word Files (*.docx)"
         )
         if not path:
             return
 
         self.is_session_loaded = False
+        p = path.lower()
 
-        if path.lower().endswith('.epub'):
+        if p.endswith('.epub'):
             self.file_type = "epub"
-        elif path.lower().endswith('.srt'):
+            self.source_format = "epub"
+        elif p.endswith('.azw3'):
+            self.file_type = "azw3"
+            self.source_format = "azw3"
+        elif p.endswith(('.mobi', '.azw')):
+            self.file_type = "mobi"
+            self.source_format = p.split('.')[-1]
+        elif p.endswith('.srt'):
             self.file_type = "srt"
-        elif path.lower().endswith('.txt'):
+            self.source_format = "srt"
+        elif p.endswith('.txt'):
             self.file_type = "txt"
+            self.source_format = "txt"
+        elif p.endswith('.pdf'):
+            self.file_type = "pdf"
+            self.source_format = "pdf"
+        elif p.endswith('.fb2'):
+            self.file_type = "fb2"
+            self.source_format = "fb2"
+        elif p.endswith('.docx'):
+            self.file_type = "docx"
+            self.source_format = "docx"
         else:
             self.show_message("Unsupported Format", "Selected file has an unsupported format.", QMessageBox.Icon.Warning)
             return
 
         self.original_file_path = path
 
-        settings_for_processor = self.app_settings.copy()
+        if hasattr(self, '_preview_toolbar'):
+            reader_supported = self.file_type in ('epub', 'fb2', 'docx', 'mobi', 'pdf')
+            self._preview_toolbar._btn_reader.setVisible(reader_supported)
 
+        settings_for_processor = self.app_settings.copy()
         if self.file_type == "epub":
             settings_for_processor['use_inline_formatting'] = self.inline_formatting_checkbox.isChecked()
             skip_inline_tags = {}
@@ -2646,12 +2829,12 @@ class TranslatorApp(QMainWindow):
                 skip_inline_tags[tag] = checkbox.isChecked()
             settings_for_processor['skip_inline_tags'] = skip_inline_tags
         else:
-            settings_for_processor['use_inline_formatting'] = False
+            settings_for_processor['use_inline_formatting'] = self.inline_formatting_checkbox.isChecked()
             settings_for_processor['skip_inline_tags'] = {}
 
         try:
             self.file_processor = FileProcessorFactory.create_processor(
-                self.file_type,
+                self.file_type,          # teraz dla .azw3 będzie AZW3Processor
                 settings_for_processor
             )
 
@@ -2667,19 +2850,13 @@ class TranslatorApp(QMainWindow):
             if not self.paragraphs:
                 raise ValueError("No paragraphs loaded from file")
 
-            if self.paragraphs and not isinstance(self.paragraphs[0], dict):
-                raise TypeError(f"Invalid paragraph format: expected dict, got {type(self.paragraphs[0])}")
-
         except Exception as e:
             logging.error(f"Failed to load file: {e}")
             traceback.print_exc()
-            self.show_message(
-                "Load Error",
-                f"Failed to load file:\n{e}",
-                QMessageBox.Icon.Critical
-            )
+            self.show_message("Load Error", f"Failed to load file:\n{e}", QMessageBox.Icon.Critical)
             self.original_file_path = None
             self.file_type = None
+            self.source_format = None
             self.paragraphs = []
             self.update_file_label()
             return
@@ -2688,21 +2865,15 @@ class TranslatorApp(QMainWindow):
             current_mode = self.inline_formatting_checkbox.isChecked()
             logger.info(f"EPUB loaded – processing mode: {'inline' if current_mode else 'legacy'}")
         else:
-            logger.info(f"{self.file_type.upper()} loaded – inline formatting not applicable (EPUB only)")
+            logger.info(f"{self.file_type.upper()} loaded – {len(self.paragraphs)} fragments")
 
         if hasattr(self, 'sentence_batch_checkbox'):
-            is_epub = self.file_type == 'epub'
-            self.sentence_batch_checkbox.setEnabled(is_epub)
-            if not is_epub:
-                self.sentence_batch_checkbox.setChecked(False)
+            self.sentence_batch_checkbox.setEnabled(True)
 
         self._initialize_components()
-
         self.populate_list()
         self.update_file_label()
-
         self.update_llm_editor_content()
-
         self._update_status_after_file_load()
 
     def _get_dot_for_para(self, para):
@@ -2710,7 +2881,7 @@ class TranslatorApp(QMainWindow):
         Return the alignment dot emoji for a paragraph, or None if not applicable.
         Mirrors the logic in _update_item_visuals.
         """
-        if not (self.file_type == 'epub' and para.get('processing_mode') == 'legacy'):
+        if para.get('processing_mode') != 'legacy':
             return None
         if not para.get('is_translated'):
             return None
@@ -2773,51 +2944,154 @@ class TranslatorApp(QMainWindow):
             self.show_message("No Data", "Please open a file first.", QMessageBox.Icon.Warning)
             return
 
-        if self.file_type == "epub":
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Save as New EPUB", "", "EPUB Files (*.epub)"
-            )
-        elif self.file_type == "srt":
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Save as New SRT", "", "SRT Files (*.srt)"
-            )
-        elif self.file_type == "txt":
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Save as New TXT", "", "Text Files (*.txt)"
-            )
+        pdf_output_format = None
+        writer_output_format = None
+        ft = self.file_type
+        sf = (self.source_format or ft or "").lower()
+
+        if ft == "epub":
+            filters = "EPUB files (*.epub);;Text files (*.txt)"
+            default_filter = "EPUB files (*.epub)"
+            title = "Save translated EPUB"
+        elif ft == "fb2":
+            filters = "EPUB files (*.epub);;FB2 files (*.fb2);;Text files (*.txt)"
+            default_filter = "EPUB files (*.epub)"
+            title = "Save translated FB2"
+        elif ft == "srt":
+            filters = "SRT files (*.srt);;Text files (*.txt)"
+            default_filter = "SRT files (*.srt)"
+            title = "Save translated SRT"
+        elif ft == "txt":
+            if any(p.get('element_type') == 'subtitle_line' for p in self.paragraphs):
+                filters = "Text files (*.txt);;SRT files (*.srt)"
+            else:
+                filters = "Text files (*.txt)"
+            default_filter = "Text files (*.txt)"
+            title = "Save translated TXT"
+        elif ft == "pdf":
+            filters = "EPUB files (*.epub);;PDF files (*.pdf);;Text files (*.txt)"
+            default_filter = "EPUB files (*.epub)"
+            title = "Save translated PDF"
+        elif ft == "docx":
+            filters = "EPUB files (*.epub);;DOCX files (*.docx);;Text files (*.txt)"
+            default_filter = "EPUB files (*.epub)"
+            title = "Save translated DOCX"
+        elif ft == "azw3" or ft == "mobi" or sf in ("mobi", "azw"):
+            filters = "EPUB files (*.epub);;Text files (*.txt)"
+            default_filter = "EPUB files (*.epub)"
+            title = f"Save translated {ft.upper() if ft else sf.upper()}"
         else:
             return
 
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, title, "", filters, default_filter
+        )
         if not path:
             return
 
+        sel = selected_filter
+        if "EPUB" in sel:
+            writer_output_format = "epub_native" if ft == "epub" else "epub"
+            expected_ext = ".epub"
+        elif "SRT" in sel:
+            writer_output_format = "srt_native"
+            expected_ext = ".srt"
+        elif "PDF" in sel:
+            pdf_output_format = "pdf"
+            expected_ext = ".pdf"
+        elif "FB2" in sel:
+            writer_output_format = "fb2"
+            expected_ext = ".fb2"
+        elif "DOCX" in sel:
+            writer_output_format = "docx"
+            expected_ext = ".docx"
+        elif "Text" in sel:
+            writer_output_format = "txt_native" if ft == "txt" else "txt"
+            expected_ext = ".txt"
+        else:
+            writer_output_format = "epub_native" if ft == "epub" else "epub"
+            expected_ext = ".epub"
+
+        root, ext = os.path.splitext(path)
+        if ext.lower() != expected_ext:
+            path = root + expected_ext
+
         try:
+            source_title = os.path.splitext(
+                os.path.basename(self.original_file_path or "Translated")
+            )[0]
+            image_resources = (
+                getattr(self.file_processor, 'image_items', [])
+                if hasattr(self, 'file_processor') and self.file_processor is not None
+                else []
+            )
+            src_fmt = self.source_format or self.file_type or 'epub'
+
             if self.file_type == "epub":
-                paragraphs_to_save = self._get_paragraphs_for_epub_save(path)
-                if paragraphs_to_save is None:
-                    return
-
-                self.epub_creator = EPUBCreatorLxml(
-                    self.file_processor.book,
-                    paragraphs_to_save,
-                    path,
-                )
-
-                self.epub_creator.finished.connect(self.on_file_saved)
-                self.epub_creator.start()
-
+                if writer_output_format == "epub_native":
+                    paragraphs_to_save = self._get_paragraphs_for_epub_save(path)
+                    if paragraphs_to_save is None:
+                        return
+                    self.epub_creator = EPUBCreatorLxml(
+                        self.file_processor.book,
+                        paragraphs_to_save,
+                        path,
+                    )
+                    self.epub_creator.finished.connect(self.on_file_saved)
+                    self.epub_creator.start()
+                elif writer_output_format == "txt":
+                    self.format_writer = TXTCreator(self.paragraphs, path)
+                    self.format_writer.finished.connect(self.on_file_saved)
+                    self.format_writer.start()
             elif self.file_type == "srt":
-                self.srt_creator = SRTCreator(self.paragraphs, path, self)
-                self.srt_creator.finished.connect(self.on_file_saved)
-                self.srt_creator.start()
-
+                if writer_output_format == "srt_native":
+                    self.srt_creator = SRTCreator(self.paragraphs, path, self)
+                    self.srt_creator.finished.connect(self.on_file_saved)
+                    self.srt_creator.start()
+                elif writer_output_format == "txt":
+                    converted = self._srt_paragraphs_to_subtitle_lines(self.paragraphs)
+                    self.format_writer = TXTCreator(converted, path)
+                    self.format_writer.finished.connect(self.on_file_saved)
+                    self.format_writer.start()
             elif self.file_type == "txt":
-                self.txt_creator = TXTCreator(self.paragraphs, path)
-                self.txt_creator.finished.connect(self.on_file_saved)
-                self.txt_creator.start()
+                if writer_output_format == "txt_native":
+                    self.txt_creator = TXTCreator(self.paragraphs, path)
+                    self.txt_creator.finished.connect(self.on_file_saved)
+                    self.txt_creator.start()
+                elif writer_output_format == "srt_native":
+                    converted = self._subtitle_lines_to_srt_paragraphs(self.paragraphs)
+                    self.srt_creator = SRTCreator(converted, path, self)
+                    self.srt_creator.finished.connect(self.on_file_saved)
+                    self.srt_creator.start()
+            elif self.file_type == "pdf":
+                original_pdf_path = self.file_processor.original_pdf_path
+                if pdf_output_format == "pdf":
+                    self.pdf_creator = PDFtoPDFCreator(self.paragraphs, original_pdf_path, path)
+                    self.pdf_creator.finished.connect(self.on_file_saved)
+                    self.pdf_creator.start()
+                elif writer_output_format == "epub":
+                    self.pdf_creator = EPUBWriter(self.paragraphs, path, source_title, source_format=src_fmt)
+                    self.pdf_creator.finished.connect(self.on_file_saved)
+                    self.pdf_creator.start()
+                elif writer_output_format == "txt":
+                    self.format_writer = TXTCreator(self.paragraphs, path)
+                    self.format_writer.finished.connect(self.on_file_saved)
+                    self.format_writer.start()
+            elif self.file_type in ("mobi", "fb2", "docx", "azw3"):
+                if writer_output_format == "epub":
+                    self.format_writer = EPUBWriter(self.paragraphs, path, source_title, image_resources=image_resources, source_format=src_fmt, css_class_styles=getattr(self.file_processor, 'css_class_styles', {}))
+                elif writer_output_format == "fb2":
+                    self.format_writer = FB2Writer(self.paragraphs, path, source_title, image_resources=image_resources, source_format=src_fmt)
+                elif writer_output_format == "docx":
+                    self.format_writer = DOCXWriter(self.paragraphs, path, source_title, image_resources=image_resources, source_format=src_fmt)
+                elif writer_output_format == "txt":
+                    self.format_writer = TXTCreator(self.paragraphs, path)
+                else:
+                    return
+                self.format_writer.finished.connect(self.on_file_saved)
+                self.format_writer.start()
 
             self.statusBar().showMessage("Saving file...", 0)
-
         except Exception as e:
             logging.error(f"Failed to save file: {e}")
             self.show_message(
@@ -2831,6 +3105,112 @@ class TranslatorApp(QMainWindow):
             self.show_message("Save Error", f"Failed to save file:\n{path}", QMessageBox.Icon.Critical)
         else:
             self.show_message("Success", f"File saved:\n{path}")
+
+    def _srt_timestamp_to_ms(self, ts: str) -> int:
+        ts = ts.strip()
+        h, m, rest = ts.split(':')
+        s, ms = rest.replace(',', '.').split('.')
+        return int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int(ms)
+
+    def _ms_to_srt_timestamp(self, ms: int) -> str:
+        ms = max(0, ms)
+        h = ms // 3600000
+        ms %= 3600000
+        m = ms // 60000
+        ms %= 60000
+        s = ms // 1000
+        ms %= 1000
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    def _srt_paragraphs_to_subtitle_lines(self, paragraphs):
+        from collections import OrderedDict
+        result = []
+        fragment_id = 1
+        for block_idx, para in enumerate(paragraphs):
+            timestamp = para.get('timestamp', '')
+            try:
+                start_str, end_str = timestamp.split('-->')
+                start_ms = self._srt_timestamp_to_ms(start_str.strip())
+                end_ms = self._srt_timestamp_to_ms(end_str.strip())
+            except Exception:
+                start_ms = 0
+                end_ms = 0
+            lines = para.get('original_clean_lines') or para.get('original_text', '').split('\n')
+            lines = [l.strip() for l in lines if l.strip()]
+            if not lines:
+                continue
+            lines_total = len(lines)
+            for line_index, line_text in enumerate(lines):
+                translated = ''
+                if para.get('is_translated'):
+                    raw = para.get('translated_text', '')
+                    split = raw.split('\n')
+                    if line_index < len(split):
+                        translated = split[line_index].strip()
+                    else:
+                        translated = raw.strip()
+                result.append({
+                    'id': str(fragment_id),
+                    'original_text': line_text,
+                    'translated_text': translated,
+                    'is_translated': bool(translated),
+                    'item_href': para.get('item_href', ''),
+                    'element_type': 'subtitle_line',
+                    'has_mismatch': False,
+                    'txt_subtitle_start': start_ms,
+                    'txt_subtitle_end': end_ms,
+                    'txt_subtitle_block_id': block_idx,
+                    'txt_subtitle_line_index': line_index,
+                    'txt_subtitle_lines_total': lines_total,
+                })
+                fragment_id += 1
+        return result
+
+    def _subtitle_lines_to_srt_paragraphs(self, paragraphs):
+        from collections import OrderedDict
+        blocks = OrderedDict()
+        for para in paragraphs:
+            bid = para.get('txt_subtitle_block_id', 0)
+            if bid not in blocks:
+                blocks[bid] = {
+                    'start': para.get('txt_subtitle_start', 0),
+                    'end': para.get('txt_subtitle_end', 0),
+                    'lines': {},
+                    'translated_lines': {},
+                    'is_translated': False,
+                }
+            line_index = para.get('txt_subtitle_line_index', 0)
+            blocks[bid]['lines'][line_index] = para.get('original_text', '')
+            if para.get('is_translated'):
+                blocks[bid]['translated_lines'][line_index] = para.get('translated_text', '')
+                blocks[bid]['is_translated'] = True
+        result = []
+        for block_num, (bid, block_data) in enumerate(blocks.items(), start=1):
+            start_ts = self._ms_to_srt_timestamp(block_data['start'])
+            end_ts = self._ms_to_srt_timestamp(block_data['end'])
+            sorted_orig = [block_data['lines'][i] for i in sorted(block_data['lines'])]
+            orig_text = '\n'.join(sorted_orig)
+            translated_text = ''
+            if block_data['is_translated']:
+                sorted_trans = [block_data['translated_lines'].get(i, block_data['lines'].get(i, '')) for i in sorted(block_data['lines'])]
+                translated_text = '\n'.join(sorted_trans)
+            result.append({
+                'id': str(block_num),
+                'original_text': orig_text,
+                'translated_text': translated_text,
+                'is_translated': block_data['is_translated'],
+                'item_href': paragraphs[0].get('item_href', '') if paragraphs else '',
+                'element_type': 'subtitle_block',
+                'timestamp': f"{start_ts} --> {end_ts}",
+                'subtitle_block': str(block_num),
+                'has_mismatch': False,
+                'srt_tags_by_line': [],
+                'original_clean_lines': sorted_orig,
+                'original_line_count': len(sorted_orig),
+                'original_split_positions': [],
+                'original_lines_with_tags': sorted_orig,
+            })
+        return result
 
     def unload_file(self):
         if not self.original_file_path:
@@ -2856,6 +3236,10 @@ class TranslatorApp(QMainWindow):
         self.paragraphs = []
         self.original_file_path = None
         self.file_type = None
+        self.source_format = None
+        if hasattr(self, 'file_processor') and self.file_processor is not None:
+            if hasattr(self.file_processor, 'cleanup_preview_tempdir'):
+                self.file_processor.cleanup_preview_tempdir()
         self.file_processor = None
         self._preview_show_original_ids.clear()
         self.is_session_loaded = False
@@ -2937,6 +3321,10 @@ class TranslatorApp(QMainWindow):
                     json_payload_template = getattr(self, '_json_payload_content', '')
                 json_response_field = self.json_response_field_edit.text().strip()
 
+            source_lang = self.source_lang_combo.currentText() if hasattr(self, 'source_lang_combo') else ""
+            target_lang = self.target_lang_combo.currentText() if hasattr(self, 'target_lang_combo') else ""
+            quick_translate_service = self.quick_translate_service_combo.currentText() if hasattr(self, 'quick_translate_service_combo') else "Google (Free)"
+
             SessionManager.save_session(
                 path=path,
                 paragraphs=self.paragraphs,
@@ -2954,7 +3342,15 @@ class TranslatorApp(QMainWindow):
                 json_payload_template=json_payload_template,
                 json_response_field=json_response_field,
                 sentence_batch_enabled=self.sentence_batch_checkbox.isChecked() if hasattr(self, 'sentence_batch_checkbox') else False,
-                sentence_batch_size=self.batch_size_spinbox.value() if hasattr(self, 'batch_size_spinbox') else 5
+                sentence_batch_size=self.batch_size_spinbox.value() if hasattr(self, 'batch_size_spinbox') else 5,
+                auto_fix_enabled=self.auto_fix_checkbox.isChecked() if hasattr(self, 'auto_fix_checkbox') else False,
+                auto_fix_attempts=self.auto_fix_spinbox.value() if hasattr(self, 'auto_fix_spinbox') else 3,
+                top_p=self.top_p_spinbox.value() if hasattr(self, 'top_p_spinbox') else 0.0,
+                top_k=self.top_k_spinbox.value() if hasattr(self, 'top_k_spinbox') else 0,
+                timeout_minutes=self.timeout_spinbox.value() if hasattr(self, 'timeout_spinbox') else 10,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                quick_translate_service=quick_translate_service
             )
 
             self.show_message("Success", f"Session saved to file:\n{path}")
@@ -2962,6 +3358,82 @@ class TranslatorApp(QMainWindow):
         except Exception as e:
             logging.error(f"Failed to save session: {e}")
             self.show_message("Session Save Error", f"Failed to save session:\n{e}", QMessageBox.Icon.Critical)
+
+    def _auto_save_session(self):
+        if not self.paragraphs:
+            return
+        if not self.original_file_path:
+            return
+
+        try:
+            base_name = os.path.splitext(os.path.basename(self.original_file_path))[0]
+            session_dir = os.path.join("session", base_name)
+            os.makedirs(session_dir, exist_ok=True)
+            save_path = os.path.join(session_dir, "autosave.json")
+
+            variant = self._get_current_variant()
+
+            custom_prompts = {}
+            if self.prompt_manager and variant:
+                prompts = self.prompt_manager.load_prompts_for_variant(variant)
+                custom_prompts = {
+                    'ollama': prompts.get('ollama'),
+                    'system': prompts.get('system'),
+                    'assistant': prompts.get('assistant'),
+                    'user': prompts.get('user')
+                }
+
+            processing_mode = 'inline' if self.app_settings.get('use_inline_formatting', True) else 'legacy'
+
+            single_prompt_mode = self.single_prompt_checkbox.isChecked()
+
+            json_payload_mode = self.json_payload_checkbox.isChecked()
+            json_payload_template = ""
+            json_response_field = ""
+
+            if json_payload_mode:
+                if hasattr(self, 'json_payload_edit'):
+                    json_payload_template = self.json_payload_edit.toPlainText().strip()
+                elif variant and variant in self.current_prompts_cache:
+                    json_payload_template = self.current_prompts_cache[variant].get('json_payload', '')
+                else:
+                    json_payload_template = getattr(self, '_json_payload_content', '')
+                json_response_field = self.json_response_field_edit.text().strip()
+
+            source_lang = self.source_lang_combo.currentText() if hasattr(self, 'source_lang_combo') else ""
+            target_lang = self.target_lang_combo.currentText() if hasattr(self, 'target_lang_combo') else ""
+            quick_translate_service = self.quick_translate_service_combo.currentText() if hasattr(self, 'quick_translate_service_combo') else "Google (Free)"
+
+            SessionManager.save_session(
+                path=save_path,
+                paragraphs=self.paragraphs,
+                original_file_path=self.original_file_path,
+                file_type=self.file_type,
+                app_settings=self.app_settings,
+                context_before=self.context_before_spinbox.value(),
+                context_after=self.context_after_spinbox.value(),
+                temperature=self.temperature_spinbox.value(),
+                custom_prompts=custom_prompts,
+                single_prompt_mode=single_prompt_mode,
+                processing_mode=processing_mode,
+                prompt_variant=variant,
+                json_payload_mode=json_payload_mode,
+                json_payload_template=json_payload_template,
+                json_response_field=json_response_field,
+                sentence_batch_enabled=self.sentence_batch_checkbox.isChecked() if hasattr(self, 'sentence_batch_checkbox') else False,
+                sentence_batch_size=self.batch_size_spinbox.value() if hasattr(self, 'batch_size_spinbox') else 5,
+                auto_fix_enabled=self.auto_fix_checkbox.isChecked() if hasattr(self, 'auto_fix_checkbox') else False,
+                auto_fix_attempts=self.auto_fix_spinbox.value() if hasattr(self, 'auto_fix_spinbox') else 3,
+                top_p=self.top_p_spinbox.value() if hasattr(self, 'top_p_spinbox') else 0.0,
+                top_k=self.top_k_spinbox.value() if hasattr(self, 'top_k_spinbox') else 0,
+                timeout_minutes=self.timeout_spinbox.value() if hasattr(self, 'timeout_spinbox') else 10,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                quick_translate_service=quick_translate_service
+            )
+
+        except Exception as e:
+            logging.error(f"Auto-save session failed: {e}")
 
     def load_session(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load Session", "", "JSON Files (*.json)")
@@ -2977,13 +3449,21 @@ class TranslatorApp(QMainWindow):
                 return
 
             confirmed_path, _ = QFileDialog.getOpenFileName(
-                self, "Confirm original file location", original_path, "Files (*.epub *.srt *.txt)"
+                self, "Confirm original file location", original_path, "Files (*.epub *.srt *.txt *.pdf *.mobi *.azw *.azw3 *.fb2 *.docx);;EPUB Files (*.epub);;SRT Files (*.srt);;Text Files (*.txt);;PDF Files (*.pdf);;Kindle Files (*.mobi *.azw *.azw3);;FB2 Files (*.fb2);;Word Files (*.docx)"
             )
             if not confirmed_path:
                 self.show_message("Error", "No original file selected.", QMessageBox.Icon.Critical)
                 return
 
             self.file_type = session_data['file_type']
+            cp = confirmed_path.lower()
+            if cp.endswith('.azw3'):
+                self.source_format = 'azw3'
+            elif cp.endswith('.azw'):
+                self.source_format = 'azw'
+            else:
+                self.source_format = self.file_type
+
             self.paragraphs = session_data['paragraphs']
             self.original_file_path = confirmed_path
             self.is_session_loaded = True
@@ -3006,6 +3486,27 @@ class TranslatorApp(QMainWindow):
             if hasattr(self, 'batch_size_spinbox'):
                 self.batch_size_spinbox.setValue(session_data.get('sentence_batch_size', 5))
 
+            if hasattr(self, 'auto_fix_checkbox'):
+                self.auto_fix_checkbox.blockSignals(True)
+                self.auto_fix_checkbox.setChecked(session_data.get('auto_fix_enabled', False))
+                self.auto_fix_checkbox.blockSignals(False)
+            if hasattr(self, 'auto_fix_spinbox'):
+                self.auto_fix_spinbox.setValue(session_data.get('auto_fix_attempts', 3))
+
+            if hasattr(self, 'top_p_spinbox'):
+                self.top_p_spinbox.setValue(session_data.get('top_p', 0.0))
+            if hasattr(self, 'top_k_spinbox'):
+                self.top_k_spinbox.setValue(session_data.get('top_k', 0))
+            if hasattr(self, 'timeout_spinbox'):
+                self.timeout_spinbox.setValue(session_data.get('timeout_minutes', 10))
+
+            if hasattr(self, 'source_lang_combo') and session_data.get('source_lang'):
+                self.source_lang_combo.setCurrentText(session_data['source_lang'])
+            if hasattr(self, 'target_lang_combo') and session_data.get('target_lang'):
+                self.target_lang_combo.setCurrentText(session_data['target_lang'])
+            if hasattr(self, 'quick_translate_service_combo') and session_data.get('quick_translate_service'):
+                self.quick_translate_service_combo.setCurrentText(session_data['quick_translate_service'])
+
             self.inline_formatting_checkbox.blockSignals(True)
             self.inline_formatting_checkbox.setChecked(use_inline)
             self.inline_formatting_checkbox.blockSignals(False)
@@ -3017,6 +3518,11 @@ class TranslatorApp(QMainWindow):
 
             self.inline_tags_group.setVisible(use_inline)
             self.alignment_section_widget.setVisible(not use_inline)
+
+            single_prompt_mode = session_data.get('single_prompt_mode', False)
+            self.single_prompt_checkbox.blockSignals(True)
+            self.single_prompt_checkbox.setChecked(single_prompt_mode)
+            self.single_prompt_checkbox.blockSignals(False)
 
             if self.file_type == "epub":
                 logger.info(f"Session loaded – EPUB mode: {'inline' if use_inline else 'legacy'}, "
@@ -3104,6 +3610,34 @@ class TranslatorApp(QMainWindow):
                         "Load Error",
                         f"Failed to load EPUB file:\n{e}\n\n"
                         f"Session paragraphs loaded, but you won't be able to save EPUB until you reload the original file.",
+                        QMessageBox.Icon.Warning
+                    )
+
+            elif self.file_type == "pdf":
+                try:
+                    logger.info(f"Loading PDF file to restore original_pdf_path...")
+                    _, original_pdf_path = self.file_processor.load(confirmed_path)
+                    logger.info(f"✓ PDF path restored (needed for saving)")
+                except Exception as e:
+                    logger.error(f"Failed to load PDF file: {e}")
+                    self.show_message(
+                        "Load Error",
+                        f"Failed to load PDF file:\n{e}\n\n"
+                        f"Session paragraphs loaded, but you won't be able to save until you reload the original file.",
+                        QMessageBox.Icon.Warning
+                    )
+
+            elif self.file_type in ("mobi", "fb2", "docx"):
+                try:
+                    logger.info(f"Loading {self.file_type.upper()} file to restore processor state...")
+                    _, _ = self.file_processor.load(confirmed_path)
+                    logger.info(f"✓ {self.file_type.upper()} processor state restored")
+                except Exception as e:
+                    logger.error(f"Failed to restore {self.file_type.upper()} processor: {e}")
+                    self.show_message(
+                        "Load Error",
+                        f"Failed to reload {self.file_type.upper()} file:\n{e}\n\n"
+                        f"Session paragraphs loaded, but saving may not work correctly.",
                         QMessageBox.Icon.Warning
                     )
 
@@ -3220,9 +3754,11 @@ class TranslatorApp(QMainWindow):
             llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
 
             if llm_choice == "Ollama":
+                custom_url = self.app_settings.get('ollama_server_url', '').strip()
                 llm_client = LLMClientFactory.create_client(
                     llm_choice="Ollama",
-                    model_name=self.app_settings.get('ollama_model_name', 'llama3.2:3b')
+                    model_name=self.app_settings.get('ollama_model_name', 'llama3.2:3b'),
+                    endpoint=custom_url if custom_url else None
                 )
             elif llm_choice == "Openrouter":
                 llm_client = LLMClientFactory.create_client(
@@ -3300,7 +3836,7 @@ class TranslatorApp(QMainWindow):
             self.finalize_translation()
             return
 
-        if hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked() and self.file_type == 'epub':
+        if hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked():
             self._translate_next_batch()
             return
 
@@ -3313,6 +3849,7 @@ class TranslatorApp(QMainWindow):
 
         self.current_fragment_index = idx
         self.translation_start_time = time.time()
+        self._eta_fragment_start = time.time()
         self.current_retry_attempt = 0
         self.current_max_attempts = 1
         self.translation_timer.start(1000)
@@ -3342,6 +3879,9 @@ class TranslatorApp(QMainWindow):
             context_before = self._get_context(idx, before=True, count=self.context_before_spinbox.value())
             context_after = self._get_context(idx, before=False, count=self.context_after_spinbox.value())
 
+            top_p_val = self.top_p_spinbox.value() if self.top_p_spinbox.value() > 0.0 else None
+            top_k_val = self.top_k_spinbox.value() if self.top_k_spinbox.value() > 0 else None
+
             self.current_worker = TranslationWorkerThread(
                 orchestrator=self.translation_orchestrator,
                 fragment=self.paragraphs[idx],
@@ -3349,7 +3889,9 @@ class TranslatorApp(QMainWindow):
                 context_after=context_after,
                 temperature=self.temperature_spinbox.value(),
                 auto_fix_manager=auto_fix_manager,
-                mismatch_checker=self.mismatch_checker
+                mismatch_checker=self.mismatch_checker,
+                top_p=top_p_val,
+                top_k=top_k_val
             )
 
             self.current_worker.progress.connect(self.on_translation_progress)
@@ -3385,39 +3927,43 @@ class TranslatorApp(QMainWindow):
             self.translate_next_fragment()
 
     def _translate_next_batch_inner(self):
-
         self._batch_mismatch_indices = []
-
         batch_size = self.batch_size_spinbox.value()
-        first_idx = self.translation_queue[0]
-        first_href = self.paragraphs[first_idx].get('item_href', '')
-
         batch_indices = []
-        for i, idx in enumerate(self.translation_queue):
-            if i >= batch_size:
+        skipped_indices = []
+        for idx in self.translation_queue:
+            if len(batch_indices) >= batch_size:
                 break
             para = self.paragraphs[idx]
-            if i > 0 and para.get('item_href', '') != first_href:
-                break
+            if para.get('is_translated', False):
+                skipped_indices.append(idx)
+                continue
             if para.get('is_non_translatable', False):
-                break
+                skipped_indices.append(idx)
+                continue
             batch_indices.append(idx)
-
+        for idx in skipped_indices:
+            self.translation_queue.remove(idx)
+            row = self.para_to_row_map.get(idx)
+            if row is not None:
+                item = self.list_widget.item(row)
+                if item:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+            self._update_progress()
         if not batch_indices:
+            if not self.translation_queue:
+                self.finalize_translation()
+                return
             batch_indices = [self.translation_queue[0]]
-
         for idx in batch_indices:
             self.translation_queue.remove(idx)
-
         self._current_batch_indices = batch_indices
-
         fragments = [self.paragraphs[i] for i in batch_indices]
-
+        for bidx in batch_indices:
+            self.paragraphs[bidx]['use_ps_markers'] = False
         context_before = self._get_context(batch_indices[0], before=True, count=self.context_before_spinbox.value())
         context_after = self._get_context(batch_indices[-1], before=False, count=self.context_after_spinbox.value())
-
         batcher = SentenceBatcher()
-
         variant = self._get_current_variant()
         batch_hint_template = ""
         if variant and variant in self.current_prompts_cache:
@@ -3425,18 +3971,18 @@ class TranslatorApp(QMainWindow):
         if not batch_hint_template:
             from app_utils import PromptManager as _PM
             batch_hint_template = _PM.get_default_batch_hint_prompt()
-
         auto_fix_manager = None
         if self.auto_fix_checkbox.isChecked():
             auto_fix_manager = AutoFixManager(
                 max_attempts=self.auto_fix_spinbox.value(),
                 base_temperature=self.temperature_spinbox.value()
             )
-
         self.translation_start_time = time.time()
+        self._eta_fragment_start = time.time()
         self.translation_timer.start(1000)
         self.current_fragment_index = batch_indices[0]
-
+        top_p_val = self.top_p_spinbox.value() if self.top_p_spinbox.value() > 0.0 else None
+        top_k_val = self.top_k_spinbox.value() if self.top_k_spinbox.value() > 0 else None
         self.current_worker = TranslationBatchWorkerThread(
             orchestrator=self.translation_orchestrator,
             fragments=fragments,
@@ -3447,9 +3993,10 @@ class TranslatorApp(QMainWindow):
             auto_fix_manager=auto_fix_manager,
             mismatch_checker=self.mismatch_checker,
             batcher=batcher,
-            batch_hint_template=batch_hint_template
+            batch_hint_template=batch_hint_template,
+            top_p=top_p_val,
+            top_k=top_k_val
         )
-
         self.current_worker.batch_progress.connect(self.on_batch_progress)
         self.current_worker.finished.connect(self.on_batch_finished)
         self.current_worker.start()
@@ -3473,6 +4020,7 @@ class TranslatorApp(QMainWindow):
                 is_now_translated = bool(synced.strip())
                 self.paragraphs[idx]['translated_text'] = synced
                 self.paragraphs[idx]['is_translated'] = is_now_translated
+                self.paragraphs[idx].pop('manually_edited', None)
 
                 self.paragraphs[idx].pop('aligned_translated_html', None)
                 self.paragraphs[idx].pop('alignment_corrections', None)
@@ -3496,6 +4044,14 @@ class TranslatorApp(QMainWindow):
         if not is_error and chars_translated > 0:
             self._update_eta(chars_translated)
 
+        if not is_error:
+            any_green = any(
+                self.paragraphs[idx].get('is_translated') and not self.paragraphs[idx].get('has_mismatch', False)
+                for idx in indices
+            )
+            if any_green:
+                self._auto_save_session()
+
         current_item = self.list_widget.currentItem()
         if current_item:
             current_idx = current_item.data(Qt.ItemDataRole.UserRole)
@@ -3508,14 +4064,13 @@ class TranslatorApp(QMainWindow):
 
         if not is_error and self._reader_window is not None:
             book = getattr(self.file_processor, 'book', None)
-            if book is not None:
-                sel_para = {}
-                current_item = self.list_widget.currentItem()
-                if current_item:
-                    ci = current_item.data(Qt.ItemDataRole.UserRole)
-                    if ci is not None and ci < len(self.paragraphs):
-                        sel_para = self.paragraphs[ci]
-                self._refresh_reader_if_open(book, sel_para)
+            sel_para = {}
+            current_item = self.list_widget.currentItem()
+            if current_item:
+                ci = current_item.data(Qt.ItemDataRole.UserRole)
+                if ci is not None and ci < len(self.paragraphs):
+                    sel_para = self.paragraphs[ci]
+            self._refresh_reader_if_open(book, sel_para)
 
     def on_batch_finished(self):
         self.translation_timer.stop()
@@ -3621,6 +4176,9 @@ class TranslatorApp(QMainWindow):
             self.current_max_attempts = self.auto_fix_spinbox.value()
             self.translation_timer.start(1000)
 
+            top_p_val = self.top_p_spinbox.value() if self.top_p_spinbox.value() > 0.0 else None
+            top_k_val = self.top_k_spinbox.value() if self.top_k_spinbox.value() > 0 else None
+
             self.current_worker = TranslationWorkerThread(
                 orchestrator=self.translation_orchestrator,
                 fragment=self.paragraphs[idx],
@@ -3628,7 +4186,9 @@ class TranslatorApp(QMainWindow):
                 context_after=context_after,
                 temperature=self.temperature_spinbox.value(),
                 auto_fix_manager=auto_fix_manager,
-                mismatch_checker=self.mismatch_checker
+                mismatch_checker=self.mismatch_checker,
+                top_p=top_p_val,
+                top_k=top_k_val
             )
 
             self.current_worker.progress.connect(self.on_translation_progress)
@@ -3639,7 +4199,6 @@ class TranslatorApp(QMainWindow):
         except Exception as e:
             logging.error(f"[Batch Mismatch Fix] Failed to start worker for fragment: {e}")
             logging.error(traceback.format_exc())
-            # Don't get stuck — continue with next mismatch or resume batch
             self._fix_next_mismatch()
 
     def on_mismatch_fix_finished(self):
@@ -3686,15 +4245,28 @@ class TranslatorApp(QMainWindow):
     def _update_eta(self, chars_done: int):
         self._eta_chars_done += chars_done
 
-        if self._eta_session_start is None:
+        if self._eta_session_start is None or self._eta_chars_done == 0:
             return
 
-        elapsed_total = time.time() - self._eta_session_start
-        if elapsed_total < 1.0 or self._eta_chars_done == 0:
-            return
+        if self._eta_fragment_start is not None:
+            fragment_elapsed = time.time() - self._eta_fragment_start
+            if fragment_elapsed > 0.05 and chars_done > 0:
+                self._eta_recent_times.append((chars_done, fragment_elapsed))
+                if len(self._eta_recent_times) > 8:
+                    self._eta_recent_times.pop(0)
+            self._eta_fragment_start = None
 
-        chars_per_sec = self._eta_chars_done / elapsed_total
         chars_left = max(0, self._eta_chars_total - self._eta_chars_done)
+
+        if len(self._eta_recent_times) >= 2:
+            total_chars = sum(c for c, _ in self._eta_recent_times)
+            total_time = sum(t for _, t in self._eta_recent_times)
+            chars_per_sec = total_chars / total_time if total_time > 0 else 0
+        else:
+            elapsed_total = time.time() - self._eta_session_start
+            if elapsed_total < 1.0:
+                return
+            chars_per_sec = self._eta_chars_done / elapsed_total
 
         if chars_per_sec <= 0:
             return
@@ -3739,6 +4311,7 @@ class TranslatorApp(QMainWindow):
 
             self.paragraphs[idx]['translated_text'] = synced_translation
             self.paragraphs[idx]['is_translated'] = is_now_translated
+            self.paragraphs[idx].pop('manually_edited', None)
 
             self.paragraphs[idx].pop('aligned_translated_html', None)
             self.paragraphs[idx].pop('alignment_corrections', None)
@@ -3753,6 +4326,13 @@ class TranslatorApp(QMainWindow):
 
         if not is_error:
             self._update_eta(len(self.paragraphs[idx].get('original_text', '')))
+
+        if (
+            not is_error
+            and self.paragraphs[idx].get('is_translated')
+            and not self.paragraphs[idx].get('has_mismatch', False)
+        ):
+            self._auto_save_session()
 
         current_item = self.list_widget.currentItem()
         if current_item:
@@ -3780,6 +4360,10 @@ class TranslatorApp(QMainWindow):
                         == self.paragraphs[idx].get('item_href')
                 ):
                     self.refresh_preview()
+
+        if not is_error and self._reader_window is not None:
+            book = getattr(self.file_processor, 'book', None)
+            self._refresh_reader_if_open(book, self.paragraphs[idx])
 
     def on_translation_finished(self):
         self.translation_timer.stop()
@@ -3863,7 +4447,7 @@ class TranslatorApp(QMainWindow):
 
     def _on_cancel_clicked(self):
         if hasattr(self, '_alignment_worker') and self._alignment_worker and self._alignment_worker.isRunning():
-            if self._hard_cancel_mode:
+            if getattr(self, '_hard_cancel_mode', False):
                 self._alignment_worker.hard_cancel()
                 self.finalize_alignment()
             else:
@@ -3882,7 +4466,7 @@ class TranslatorApp(QMainWindow):
                     QPushButton:pressed { background-color: #440000; }
                 """)
             return
-        if self._hard_cancel_mode:
+        if getattr(self, '_hard_cancel_mode', False):
             self._hard_cancel_translation()
         else:
             self.cancel_translation()
@@ -3960,6 +4544,7 @@ class TranslatorApp(QMainWindow):
         self._eta_session_start = None
         self._eta_chars_done = 0
         self._eta_recent_times = []
+        self._eta_fragment_start = None
 
         if self.translation_cancelled:
             self.statusBar().showMessage("⛔ Translation cancelled.", 5000)
@@ -3984,13 +4569,9 @@ class TranslatorApp(QMainWindow):
 
         self._reset_cancel_button()
 
-
-
     def _is_legacy_mode(self) -> bool:
-        """Returns True if loaded file is EPUB in legacy processing mode."""
         return (
-            self.file_type == 'epub'
-            and bool(self.paragraphs)
+            bool(self.paragraphs)
             and self.paragraphs[0].get('processing_mode') == 'legacy'
         )
 
@@ -3998,11 +4579,12 @@ class TranslatorApp(QMainWindow):
         """Show/hide btn_alignment and tabs based on file type and mode."""
         is_legacy = self._is_legacy_mode()
         is_epub   = self.file_type == 'epub'
+        preview_supported = self.file_type in ('epub', 'fb2', 'docx', 'mobi', 'pdf')
         if hasattr(self, 'btn_alignment'):
             self.btn_alignment.setVisible(is_legacy)
         if hasattr(self, 'panel_tabs'):
             self.panel_tabs.setTabVisible(1, is_legacy)
-            self.panel_tabs.setTabVisible(2, is_epub)
+            self.panel_tabs.setTabVisible(2, preview_supported)
         if hasattr(self, '_alignment_filter_row'):
             on_alignment_tab = (
                 hasattr(self, 'panel_tabs')
@@ -4254,60 +4836,111 @@ class TranslatorApp(QMainWindow):
             if _widget is not None:
                 _widget.setVisible(not is_preview_tab)
 
-    def refresh_preview(self):
-        """
-        Regenerate the Preview tab content for the currently selected fragment.
-        Called when the user switches to the Preview tab or selects a new fragment
-        while already on the Preview tab.
-        """
+    def refresh_preview(self, selected_para: dict = None):
         if not hasattr(self, 'epub_preview_view'):
             return
 
-        current_item = self.list_widget.currentItem()
-        if not current_item:
-            self.epub_preview_view.setHtml(
-                '<html><body style="background:#1a1a1a;margin:0;padding:24px;">'
-                '<p style="color:#666;font-family:sans-serif;font-size:13px;">'
-                'No fragment selected.</p></body></html>'
-            )
-            return
+        if selected_para is None:
+            current_item = self.list_widget.currentItem()
+            if not current_item:
+                self.epub_preview_view.setHtml(
+                    '<html><body style="background:#1a1a1a;margin:0;padding:24px;">'
+                    '<p style="color:#666;font-family:sans-serif;font-size:13px;">'
+                    'No fragment selected.</p></body></html>'
+                )
+                return
+            idx = current_item.data(Qt.ItemDataRole.UserRole)
+            if idx is None or not self.paragraphs:
+                return
+            selected_para = self.paragraphs[idx]
 
-        idx = current_item.data(Qt.ItemDataRole.UserRole)
-        if idx is None or not self.paragraphs:
-            return
+        file_type = self.file_type
 
-        book = getattr(self.file_processor, 'book', None)
-        if book is None:
-            self.epub_preview_view.setHtml(
-                '<html><body style="background:#1a1a1a;margin:0;padding:24px;">'
-                '<p style="color:#666;font-family:sans-serif;font-size:13px;">'
-                'No EPUB book object available.</p></body></html>'
-            )
-            return
-
-        selected_para = self.paragraphs[idx]
+        if hasattr(self, '_preview_toolbar') and self.paragraphs:
+            chapter_list = EPUBPreviewEngine.get_chapter_list(self.paragraphs)
+            current_href = selected_para.get('item_href', '')
+            self._preview_toolbar.set_chapters(chapter_list, current_href)
 
         try:
-            if hasattr(self, '_preview_toolbar') and self.paragraphs:
-                chapter_list = EPUBPreviewEngine.get_chapter_list(self.paragraphs)
-                current_href = selected_para.get('item_href', '')
-                self._preview_toolbar.set_chapters(chapter_list, current_href)
+            if file_type == 'epub':
+                book = getattr(self.file_processor, 'book', None)
+                if book is None:
+                    self.epub_preview_view.setHtml(
+                        '<html><body style="background:#1a1a1a;margin:0;padding:24px;">'
+                        '<p style="color:#666;font-family:sans-serif;font-size:13px;">'
+                        'No EPUB book object available.</p></body></html>'
+                    )
+                    return
+                html_str = self._preview_engine.generate_preview_html(
+                    book, self.paragraphs, selected_para,
+                    show_original_ids=self._preview_show_original_ids,
+                    dark_mode=self._preview_dark_mode,
+                )
+                base_url = QUrl.fromLocalFile(
+                    os.path.abspath(book.content_dir) + os.sep
+                )
+                self.epub_preview_view.setContent(
+                    html_str.encode('utf-8'),
+                    'application/xhtml+xml',
+                    base_url
+                )
+                self._refresh_reader_if_open(book, selected_para)
 
-            html_str = self._preview_engine.generate_preview_html(
-                book, self.paragraphs, selected_para,
-                show_original_ids=self._preview_show_original_ids,
-                dark_mode=self._preview_dark_mode,
-            )
-            base_url = QUrl.fromLocalFile(
-                os.path.abspath(book.content_dir) + os.sep
-            )
-            self.epub_preview_view.setContent(
-                html_str.encode('utf-8'),
-                'application/xhtml+xml',
-                base_url
-            )
+            elif file_type == 'fb2':
+                from preview import FB2PreviewEngine
+                engine = FB2PreviewEngine()
+                fb2_path = getattr(self.file_processor, 'original_fb2_path', None)
+                if not fb2_path:
+                    return
+                html_str = engine.generate_preview_html(
+                    fb2_path, self.paragraphs, selected_para,
+                    show_original_ids=self._preview_show_original_ids,
+                    dark_mode=self._preview_dark_mode,
+                )
+                self.epub_preview_view.setHtml(html_str)
 
-            self._refresh_reader_if_open(book, selected_para)
+            elif file_type == 'docx':
+                from preview import DOCXPreviewEngine
+                engine = DOCXPreviewEngine()
+                docx_path = getattr(self.file_processor, 'original_docx_path', None)
+                if not docx_path:
+                    return
+                html_str = engine.generate_preview_html(
+                    docx_path, self.paragraphs, selected_para,
+                    show_original_ids=self._preview_show_original_ids,
+                    dark_mode=self._preview_dark_mode,
+                )
+                self.epub_preview_view.setHtml(html_str)
+
+            elif file_type == 'mobi':
+                from preview import MobiPreviewEngine
+                engine = MobiPreviewEngine()
+                html_str = engine.generate_preview_html(
+                    self.file_processor, self.paragraphs, selected_para,
+                    show_original_ids=self._preview_show_original_ids,
+                    dark_mode=self._preview_dark_mode,
+                )
+                self.epub_preview_view.setHtml(html_str)
+
+            elif file_type == 'pdf':
+                from preview import PDFPreviewEngine
+                engine = PDFPreviewEngine()
+                pdf_path = getattr(self.file_processor, 'original_pdf_path', None)
+                if not pdf_path:
+                    return
+                html_str = engine.generate_preview_html(
+                    pdf_path, self.paragraphs, selected_para,
+                    show_original_ids=self._preview_show_original_ids,
+                    dark_mode=self._preview_dark_mode,
+                )
+                self.epub_preview_view.setHtml(html_str)
+
+            else:
+                self.epub_preview_view.setHtml(
+                    '<html><body style="background:#1a1a1a;padding:24px;">'
+                    '<p style="color:#666;font-family:sans-serif;font-size:13px;">'
+                    f'Preview not available for format: {file_type}</p></body></html>'
+                )
 
         except Exception as exc:
             logger.error(f'Preview generation failed: {exc}', exc_info=True)
@@ -4399,41 +5032,48 @@ class TranslatorApp(QMainWindow):
         self.refresh_preview()
 
     def _on_preview_chapter_changed(self, item_href: str):
-        """
-        Navigate to the first paragraph of *item_href* when the user clicks
-        the Prev / Next chapter buttons in the preview toolbar.
-        """
         if not self.paragraphs:
             return
-        para_index = EPUBPreviewEngine.first_para_index_for_chapter(
-            self.paragraphs, item_href
-        )
+
+        para_index = -1
+        for i, para in enumerate(self.paragraphs):
+            if para.get('item_href') == item_href and i in self.para_to_row_map:
+                para_index = i
+                break
+
+        if para_index < 0:
+            for i, para in enumerate(self.paragraphs):
+                if para.get('item_href') == item_href:
+                    para_index = i
+                    break
+
         if para_index < 0:
             return
-        row = self.para_to_row_map.get(para_index)
-        if row is None:
-            return
-        item = self.list_widget.item(row)
-        if item is None:
-            return
-        self.list_widget.blockSignals(True)
-        self.list_widget.setCurrentItem(item)
-        self.list_widget.scrollToItem(item, QListWidget.ScrollHint.EnsureVisible)
-        self.list_widget.blockSignals(False)
 
-        idx = para_index
-        self.original_text_view.setPlainText(
-            self._format_text_for_display(self.paragraphs[idx]['original_text'])
-        )
-        self.translated_text_view.textChanged.disconnect(self.update_translation_from_edit)
-        self.translated_text_view.setPlainText(
-            self._format_text_for_display(self.paragraphs[idx]['translated_text'])
-        )
-        self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
-        self._update_alignment_tab(idx)
-        self._update_translation_field_state(self.paragraphs[idx])
+        selected_para = self.paragraphs[para_index]
+        row = self.para_to_row_map.get(para_index)
+
+        if row is not None:
+            item = self.list_widget.item(row)
+            if item is not None:
+                self.list_widget.blockSignals(True)
+                self.list_widget.setCurrentItem(item)
+                self.list_widget.scrollToItem(item, QListWidget.ScrollHint.EnsureVisible)
+                self.list_widget.blockSignals(False)
+
+                self.original_text_view.setPlainText(
+                    self._format_text_for_display(selected_para['original_text'])
+                )
+                self.translated_text_view.textChanged.disconnect(self.update_translation_from_edit)
+                self.translated_text_view.setPlainText(
+                    self._format_text_for_display(selected_para['translated_text'])
+                )
+                self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
+                self._update_alignment_tab(para_index)
+                self._update_translation_field_state(selected_para)
+
         self._preview_show_original_ids.clear()
-        self.refresh_preview()
+        self.refresh_preview(selected_para)
 
     def _on_preview_dark_mode_toggled(self, dark: bool):
         """Store dark-mode preference and re-render the preview."""
@@ -4441,8 +5081,9 @@ class TranslatorApp(QMainWindow):
         self.refresh_preview()
 
     def _on_open_reader(self):
-        book = getattr(self.file_processor, 'book', None)
-        if book is None or not self.paragraphs:
+        if self.file_type not in ('epub', 'fb2', 'docx', 'mobi', 'pdf'):
+            return
+        if not self.paragraphs:
             return
 
         current_item = self.list_widget.currentItem()
@@ -4451,22 +5092,56 @@ class TranslatorApp(QMainWindow):
             idx = 0
         selected_para = self.paragraphs[idx]
 
-        if self._reader_window is not None:
-            try:
-                self._reader_window.navigate_to_para(book, self.paragraphs, idx)
-                self._reader_window.raise_()
-                self._reader_window.activateWindow()
+        if self.file_type == 'epub':
+            book = getattr(self.file_processor, 'book', None)
+            if book is None:
                 return
-            except RuntimeError:
-                self._reader_window = None
+            if self._reader_window is not None:
+                try:
+                    self._reader_window.navigate_to_para(book, self.paragraphs, idx)
+                    self._reader_window.raise_()
+                    self._reader_window.activateWindow()
+                    return
+                except RuntimeError:
+                    self._reader_window = None
+            self._reader_window = EPUBReaderWindow(
+                book, self.paragraphs, selected_para,
+                dark_mode=self._preview_dark_mode,
+                parent=None,
+            )
+            self._reader_window.closed.connect(self._on_reader_closed)
+            self._reader_window.show()
+        else:
+            if self.file_type == 'fb2':
+                source = getattr(self.file_processor, 'original_fb2_path', None)
+            elif self.file_type == 'docx':
+                source = getattr(self.file_processor, 'original_docx_path', None)
+            elif self.file_type == 'mobi':
+                source = self.file_processor
+            elif self.file_type == 'pdf':
+                source = getattr(self.file_processor, 'original_pdf_path', None)
+            else:
+                source = None
 
-        self._reader_window = EPUBReaderWindow(
-            book, self.paragraphs, selected_para,
-            dark_mode=self._preview_dark_mode,
-            parent=None,
-        )
-        self._reader_window.closed.connect(self._on_reader_closed)
-        self._reader_window.show()
+            if source is None:
+                return
+
+            if self._reader_window is not None:
+                try:
+                    self._reader_window.navigate_to_para(self.paragraphs, idx)
+                    self._reader_window.raise_()
+                    self._reader_window.activateWindow()
+                    return
+                except RuntimeError:
+                    self._reader_window = None
+
+            self._reader_window = GenericReaderWindow(
+                self.file_type, source, self.paragraphs, selected_para,
+                dark_mode=self._preview_dark_mode,
+                parent=None,
+            )
+            self._reader_window.closed.connect(self._on_reader_closed)
+            self._reader_window.show()
 
     def _on_reader_closed(self):
         self._reader_window = None
@@ -4475,7 +5150,11 @@ class TranslatorApp(QMainWindow):
         if self._reader_window is None:
             return
         try:
-            self._reader_window.refresh_chapter(book, self.paragraphs, selected_para)
+            if isinstance(self._reader_window, EPUBReaderWindow):
+                self._reader_window.refresh_chapter(book, self.paragraphs, selected_para)
+            else:
+                self._reader_window.refresh_chapter(self.paragraphs, selected_para,
+                                                     self._preview_dark_mode)
         except RuntimeError:
             self._reader_window = None
 
@@ -4694,6 +5373,7 @@ class TranslatorApp(QMainWindow):
 
         self.paragraphs[idx]['translated_text'] = edited_text
         self.paragraphs[idx]['is_translated'] = is_now_translated
+        self.paragraphs[idx]['manually_edited'] = True
 
         if was_translated and is_now_translated:
             if self.paragraphs[idx].get('aligned_translated_html'):
@@ -4843,6 +5523,19 @@ class TranslatorApp(QMainWindow):
                 f"(ratio: {ratio:.2f}x)"
             )
 
+        if flags.get("content_drift"):
+            orig_text = para_data.get("original_text", "")
+            trans_text = para_data.get("translated_text", "")
+            orig_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|</?ps>|<nt_\d{2}/>', '', orig_text)
+            trans_clean = re.sub(r'</?p_\d{2}>|<id_\d{2}>|</id_\d{2}>|</?ps>|<nt_\d{2}/>', '', trans_text)
+            drift_orig_len = len(orig_clean)
+            drift_trans_len = len(trans_clean)
+            drift_ratio = drift_trans_len / max(drift_orig_len, 1)
+            structure_issues.append(
+                f"• <b>Content drift:</b> Translation is {drift_ratio:.1f}× longer than original "
+                f"with no shared vocabulary — LLM may have added content or deviated from source"
+            )
+
         if structure_issues:
             lines.append("<u>Text Structure:</u>")
             lines.extend(structure_issues)
@@ -4874,7 +5567,7 @@ class TranslatorApp(QMainWindow):
 
         if flags.get("quote_parity"):
             trans_text = para_data.get("translated_text", "")
-            quote_count = sum(1 for ch in trans_text if ch in '"\u201C\u201D\u201E\u201F\u00AB\u00BB\u301D\u301E\u301F\uFF02')
+            quote_count = sum(1 for ch in trans_text if ch in DOUBLE_QUOTES_CHARS)
             formatting_issues.append(
                 f"• <b>Quote parity:</b> Odd number of quotes ({quote_count}) - likely unpaired"
             )
@@ -4923,6 +5616,43 @@ class TranslatorApp(QMainWindow):
                             )
                     if len(positioning_res) > 3:
                         lines.append(f"  &nbsp;&nbsp;... (+{len(positioning_res) - 3} more)")
+                lines.append("")
+
+        nt_errors = flags.get("nt_markers")
+        if nt_errors and isinstance(nt_errors, dict):
+            missing_nt    = nt_errors.get("missing", [])
+            extra_nt      = nt_errors.get("extra", [])
+            positioning_nt = nt_errors.get("positioning", [])
+
+            if missing_nt or extra_nt or positioning_nt:
+                lines.append("<u>NT Markers (&lt;nt_XX/&gt;):</u>")
+                if missing_nt:
+                    nt_str = ", ".join(missing_nt[:5])
+                    if len(missing_nt) > 5:
+                        nt_str += f", ... (+{len(missing_nt) - 5} more)"
+                    lines.append(f"• <b>Missing NT markers (padding/anchors):</b> {nt_str}")
+                    lines.append(f"  &nbsp;&nbsp;<i>Keep these markers in the same position as original</i>")
+                if extra_nt:
+                    nt_str = ", ".join(extra_nt[:5])
+                    if len(extra_nt) > 5:
+                        nt_str += f", ... (+{len(extra_nt) - 5} more)"
+                    lines.append(f"• <b>Extra NT markers:</b> {nt_str}")
+                if positioning_nt:
+                    lines.append(f"• <b>Position shifted ({len(positioning_nt)} marker(s)):</b>")
+                    for pos_err in positioning_nt[:3]:
+                        tag_id = pos_err.get('tag_id', '??')
+                        desc   = pos_err.get('description', '')
+                        if desc:
+                            lines.append(f"  &nbsp;&nbsp;<i>{desc}</i>")
+                        else:
+                            orig_pos  = pos_err.get('orig_rel_pos', 0)
+                            trans_pos = pos_err.get('trans_rel_pos', 0)
+                            lines.append(
+                                f"  &nbsp;&nbsp;nt_{tag_id}/: ~{orig_pos:.0%} in original "
+                                f"→ ~{trans_pos:.0%} in translation"
+                            )
+                    if len(positioning_nt) > 3:
+                        lines.append(f"  &nbsp;&nbsp;... (+{len(positioning_nt) - 3} more)")
                 lines.append("")
 
         inline_errors = flags.get("inline_formatting")
@@ -5036,18 +5766,6 @@ class TranslatorApp(QMainWindow):
                 if len(positioning) > 3:
                     lines.append(f"  &nbsp;&nbsp;... (+{len(positioning) - 3} more)")
 
-            nt_errors = inline_errors.get("nt_markers", {})
-            if nt_errors:
-                missing_nt = nt_errors.get("missing", [])
-                extra_nt   = nt_errors.get("extra", [])
-                if missing_nt:
-                    nt_str = ", ".join(missing_nt[:5])
-                    lines.append(f"• <b>Missing NT markers (padding/anchors):</b> {nt_str}")
-                    lines.append(f"  &nbsp;&nbsp;<i>Keep these markers in the same position as original</i>")
-                if extra_nt:
-                    nt_str = ", ".join(extra_nt[:5])
-                    lines.append(f"• <b>Extra NT markers:</b> {nt_str}")
-
             lines.append("")
 
         if not is_forced:
@@ -5084,6 +5802,22 @@ class TranslatorApp(QMainWindow):
 
         if self.file_type == "srt":
             self.statusBar().showMessage("🎬 SRT file loaded - ready to translate", 5000)
+            return
+
+        if self.file_type == "pdf":
+            self.statusBar().showMessage("📕 PDF file loaded - ready to translate", 5000)
+            return
+
+        if self.file_type == "mobi":
+            self.statusBar().showMessage("📱 Kindle file loaded - ready to translate", 5000)
+            return
+
+        if self.file_type == "fb2":
+            self.statusBar().showMessage("📗 FB2 file loaded - ready to translate", 5000)
+            return
+
+        if self.file_type == "docx":
+            self.statusBar().showMessage("📘 DOCX file loaded - ready to translate", 5000)
             return
 
         if self.file_type == "epub":
@@ -5125,7 +5859,9 @@ class TranslatorApp(QMainWindow):
         self.btn_save_llm_instruction.setVisible(has_file)
 
         if self.llm_editor_container.isVisible():
-            self.single_prompt_checkbox.setVisible(has_file)
+            llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
+            is_ollama = llm_choice == "Ollama"
+            self.single_prompt_checkbox.setVisible(has_file and not is_ollama)
 
         if has_file:
             filename = os.path.basename(self.original_file_path)
@@ -5139,6 +5875,18 @@ class TranslatorApp(QMainWindow):
             elif self.file_type == "txt":
                 icon = "📄"
                 color = "#aaffaa"
+            elif self.file_type == "pdf":
+                icon = "📕"
+                color = "#ffddaa"
+            elif self.file_type == "mobi":
+                icon = "📱"
+                color = "#cc99ff"
+            elif self.file_type == "fb2":
+                icon = "📗"
+                color = "#99ffcc"
+            elif self.file_type == "docx":
+                icon = "📘"
+                color = "#aaccff"
             else:
                 icon = "📁"
                 color = "#cccccc"
@@ -5389,7 +6137,7 @@ class TranslatorApp(QMainWindow):
                 current_y = event.position().y()
                 delta_from_start = current_y - self._drag_start_y
 
-                if not self._drag_threshold_passed and abs(delta_from_start) > 5:
+                if not self._drag_threshold_passed and abs(delta_from_start) > 15:
                     self._drag_threshold_passed = True
                     self._drag_scrolling = True
                     self._drag_last_y = current_y
@@ -5425,15 +6173,22 @@ class TranslatorApp(QMainWindow):
         current_idx = current_item.data(Qt.ItemDataRole.UserRole)
 
         if checked_indices:
+            same_indices = self._get_same_text_indices(checked_indices)
+            same_count = len(same_indices)
+
             msg_box = QMessageBox(self)
             msg_box.setIcon(QMessageBox.Icon.Question)
             msg_box.setWindowTitle("Copy Original to Translation")
-            msg_box.setText(f"What would you like to copy?\n\n"
-                           f"• Current fragment only (#{current_idx + 1})\n"
-                           f"• All {len(checked_indices)} checked fragments")
+            msg_box.setText(
+                f"What would you like to copy?\n\n"
+                f"• Current fragment only (#{current_idx + 1})\n"
+                f"• All {len(checked_indices)} checked fragments\n"
+                f"• All fragments with identical text ({same_count} total)"
+            )
 
             btn_current = msg_box.addButton("Current Only", QMessageBox.ButtonRole.YesRole)
             btn_all_checked = msg_box.addButton(f"All Checked ({len(checked_indices)})", QMessageBox.ButtonRole.NoRole)
+            btn_all_same = msg_box.addButton(f"All the Same ({same_count})", QMessageBox.ButtonRole.NoRole)
             btn_cancel = msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
 
             msg_box.exec()
@@ -5447,18 +6202,58 @@ class TranslatorApp(QMainWindow):
             elif clicked_button == btn_all_checked:
                 self._copy_multiple_fragments(checked_indices)
                 self.statusBar().showMessage(f"{len(checked_indices)} fragments copied.", 3000)
+            elif clicked_button == btn_all_same:
+                self._copy_multiple_fragments(same_indices)
+                self.statusBar().showMessage(f"{same_count} fragments with identical text copied.", 3000)
         else:
-            msg_box = QMessageBox(self)
-            msg_box.setIcon(QMessageBox.Icon.Question)
-            msg_box.setWindowTitle("Copy Original to Translation")
-            msg_box.setText(f"Copy original text to translation for fragment #{current_idx + 1}?")
-            msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+            same_indices = self._get_same_text_indices([current_idx])
+            same_count = len(same_indices)
 
-            result = msg_box.exec()
+            if same_count > 1:
+                msg_box = QMessageBox(self)
+                msg_box.setIcon(QMessageBox.Icon.Question)
+                msg_box.setWindowTitle("Copy Original to Translation")
+                msg_box.setText(
+                    f"What would you like to copy?\n\n"
+                    f"• Current fragment only (#{current_idx + 1})\n"
+                    f"• All fragments with identical text ({same_count} total)"
+                )
 
-            if result == QMessageBox.StandardButton.Yes:
-                self._copy_single_fragment(current_idx)
-                self.statusBar().showMessage(f"Fragment #{current_idx + 1} copied.", 2000)
+                btn_current = msg_box.addButton("Current Only", QMessageBox.ButtonRole.YesRole)
+                btn_all_same = msg_box.addButton(f"All the Same ({same_count})", QMessageBox.ButtonRole.NoRole)
+                btn_cancel = msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+
+                msg_box.exec()
+                clicked_button = msg_box.clickedButton()
+
+                if clicked_button == btn_cancel:
+                    return
+                elif clicked_button == btn_current:
+                    self._copy_single_fragment(current_idx)
+                    self.statusBar().showMessage(f"Fragment #{current_idx + 1} copied.", 2000)
+                elif clicked_button == btn_all_same:
+                    self._copy_multiple_fragments(same_indices)
+                    self.statusBar().showMessage(f"{same_count} fragments with identical text copied.", 3000)
+            else:
+                msg_box = QMessageBox(self)
+                msg_box.setIcon(QMessageBox.Icon.Question)
+                msg_box.setWindowTitle("Copy Original to Translation")
+                msg_box.setText(f"Copy original text to translation for fragment #{current_idx + 1}?")
+                msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+
+                if msg_box.exec() == QMessageBox.StandardButton.Yes:
+                    self._copy_single_fragment(current_idx)
+                    self.statusBar().showMessage(f"Fragment #{current_idx + 1} copied.", 2000)
+
+    def _get_same_text_indices(self, source_indices):
+        source_texts = {self.paragraphs[idx]['original_text'] for idx in source_indices}
+        result = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            idx = item.data(Qt.ItemDataRole.UserRole)
+            if self.paragraphs[idx]['original_text'] in source_texts:
+                result.append(idx)
+        return result
 
     def _copy_single_fragment(self, idx):
         original_text = self.paragraphs[idx]['original_text']
@@ -5528,7 +6323,8 @@ class TranslatorApp(QMainWindow):
 
         para['force_mismatch'] = True
 
-        self.mismatch_checker.check_mismatch(para)
+        if self.mismatch_checker:
+            self.mismatch_checker.check_mismatch(para)
 
         self._update_item_visuals(idx)
         self.statusBar().showMessage("Fragment FLAGGED for review.", 2000)
@@ -5616,10 +6412,8 @@ class TranslatorApp(QMainWindow):
 
     def _quick_translate_single(self, idx: int, service: str, source_lang: str, target_lang: str):
         original_text = self.paragraphs[idx]['original_text']
-
         text_to_translate, had_newlines, original_parts, original_separators = \
             self._prepare_text_for_quick_translate(original_text)
-
         try:
             translated_text = self._do_quick_translate(
                 text=text_to_translate,
@@ -5635,26 +6429,22 @@ class TranslatorApp(QMainWindow):
             self.paragraphs[idx]['is_translated'] = False
             self._update_item_visuals(idx)
             return
-
         translated_text = self._restore_quick_translate_structure(
             translated_text, had_newlines, original_parts, original_separators
         )
-
         self.paragraphs[idx]['translated_text'] = translated_text
         self.paragraphs[idx]['is_translated'] = True
+        self.paragraphs[idx].pop('manually_edited', None)
         self.paragraphs[idx].pop('aligned_translated_html', None)
         self.paragraphs[idx].pop('alignment_corrections', None)
         self.paragraphs[idx].pop('alignment_uncertain', None)
         self._update_item_visuals(idx)
-
         row = self.para_to_row_map.get(idx)
         if row is not None:
             item = self.list_widget.item(row)
             if item and self.paragraphs[idx].get('is_translated', False):
                 item.setCheckState(Qt.CheckState.Unchecked)
-
         self.update_file_label()
-
         current_item = self.list_widget.currentItem()
         if current_item and current_item.data(Qt.ItemDataRole.UserRole) == idx:
             self.translated_text_view.textChanged.disconnect(self.update_translation_from_edit)
@@ -5663,21 +6453,17 @@ class TranslatorApp(QMainWindow):
             )
             self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
             self._update_alignment_tab(idx)
-
         self.statusBar().showMessage(f"[{service}] Fragment #{idx + 1} translated.", 3000)
 
     def _quick_translate_multiple(self, indices: list, service: str, source_lang: str, target_lang: str):
         success_count = 0
         error_count = 0
         first_error_msg = None
-
         for i, idx in enumerate(indices):
             self.statusBar().showMessage(
                 f"[{service}] Translating fragment {i + 1}/{len(indices)} (#{idx + 1})...", 0
             )
-
             QApplication.processEvents()
-
             original_text = self.paragraphs[idx].get('original_text', '')
             if not original_text.strip():
                 row = self.para_to_row_map.get(idx)
@@ -5686,10 +6472,8 @@ class TranslatorApp(QMainWindow):
                     if item:
                         item.setCheckState(Qt.CheckState.Unchecked)
                 continue
-
             text_to_translate, had_newlines, original_parts, original_separators = \
                 self._prepare_text_for_quick_translate(original_text)
-
             try:
                 translated_text = self._do_quick_translate(
                     text=text_to_translate,
@@ -5697,21 +6481,18 @@ class TranslatorApp(QMainWindow):
                     source_lang=source_lang,
                     target_lang=target_lang
                 )
-
                 translated_text = self._restore_quick_translate_structure(
                     translated_text, had_newlines, original_parts, original_separators
                 )
-
                 self.paragraphs[idx]['translated_text'] = translated_text
                 self.paragraphs[idx]['is_translated'] = True
+                self.paragraphs[idx].pop('manually_edited', None)
                 self._update_item_visuals(idx)
-
                 row = self.para_to_row_map.get(idx)
                 if row is not None:
                     item = self.list_widget.item(row)
                     if item and self.paragraphs[idx].get('is_translated', False):
                         item.setCheckState(Qt.CheckState.Unchecked)
-
                 current_item = self.list_widget.currentItem()
                 if current_item and current_item.data(Qt.ItemDataRole.UserRole) == idx:
                     self.translated_text_view.textChanged.disconnect(self.update_translation_from_edit)
@@ -5719,9 +6500,7 @@ class TranslatorApp(QMainWindow):
                         self._format_text_for_display(translated_text)
                     )
                     self.translated_text_view.textChanged.connect(self.update_translation_from_edit)
-
                 success_count += 1
-
             except Exception as e:
                 error_msg = str(e)
                 logging.error(f"Quick translate error [{service}] idx={idx}: {error_msg}")
@@ -5731,11 +6510,8 @@ class TranslatorApp(QMainWindow):
                 error_count += 1
                 if first_error_msg is None:
                     first_error_msg = error_msg
-
                 break
-
         self.update_file_label()
-
         if error_count == 0:
             self.statusBar().showMessage(
                 f"[{service}] All {success_count} fragments translated successfully.", 5000
@@ -5756,13 +6532,6 @@ class TranslatorApp(QMainWindow):
 
         if service == "Google (Free)":
             try:
-                pass
-            except ImportError:
-                raise Exception(
-                    "deep-translator is not installed.\n"
-                    "Run: pip install deep-translator"
-                )
-            try:
                 translator = GoogleTranslator(source=source_lang, target=target_lang)
                 result = translator.translate(text)
                 if not result:
@@ -5779,14 +6548,6 @@ class TranslatorApp(QMainWindow):
                 raise Exception(f"Google Translate error: {err}")
 
         elif service in ("DeepL Free", "DeepL Pro"):
-            try:
-                pass
-            except ImportError:
-                raise Exception(
-                    "Biblioteka deepl nie jest zainstalowana.\n"
-                    "Uruchom: pip install deepl"
-                )
-
             use_free = (service == "DeepL Free")
             api_key = (
                 self.app_settings.get("deepl_free_api_key", "")
@@ -5902,11 +6663,13 @@ class TranslatorApp(QMainWindow):
     def toggle_llm_editor(self):
         is_visible = self.llm_editor_container.isVisible()
         self.llm_editor_container.setVisible(not is_visible)
-
+ 
         if not is_visible:
             self.update_llm_editor_content()
             has_file = bool(self.original_file_path)
-            self.single_prompt_checkbox.setVisible(has_file)
+            llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
+            is_ollama = llm_choice == "Ollama"
+            self.single_prompt_checkbox.setVisible(has_file and not is_ollama)
             self.json_payload_checkbox.setVisible(has_file)
             is_json = self.json_payload_checkbox.isChecked()
             self.json_response_field_label.setVisible(has_file and is_json)
@@ -5917,43 +6680,46 @@ class TranslatorApp(QMainWindow):
             item = self.llm_editor_layout.itemAt(i)
             if item and item.widget():
                 item.widget().deleteLater()
-
+ 
         has_file = bool(self.original_file_path)
-
-        self.single_prompt_checkbox.setVisible(has_file and not self.json_payload_checkbox.isChecked())
-        self.json_payload_checkbox.setVisible(has_file)
+        llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
+        is_ollama = llm_choice == "Ollama"
         is_json = self.json_payload_checkbox.isChecked()
+        is_single = self.single_prompt_checkbox.isChecked()
+ 
+        self.single_prompt_checkbox.setVisible(has_file and not is_ollama and not is_json)
+        self.json_payload_checkbox.setVisible(has_file)
         self.json_response_field_label.setVisible(has_file and is_json)
         self.json_response_field_edit.setVisible(has_file and is_json)
-
+ 
         if not has_file:
             label = QLabel("Load a file first to edit LLM prompts")
             label.setStyleSheet("color: #888; padding: 20px;")
             self.llm_editor_layout.addWidget(label)
-            for attr in ('ollama_prompt_edit', 'system_prompt_edit',
+            for attr in ('ollama_prompt_edit', 'single_prompt_edit', 'system_prompt_edit',
                          'assistant_prompt_edit', 'user_prompt_edit',
                          'json_payload_edit', 'batch_hint_edit'):
                 if hasattr(self, attr):
                     delattr(self, attr)
             return
-
+ 
         batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
-
+ 
         outer_splitter = QSplitter(Qt.Orientation.Vertical)
-
-        if self.json_payload_checkbox.isChecked():
+ 
+        if is_json:
             main_widget = QWidget()
             main_layout = QVBoxLayout(main_widget)
             main_layout.setContentsMargins(0, 0, 0, 0)
             main_layout.setSpacing(4)
-
+ 
             if batch_mode:
                 info_label = QLabel("JSON Payload Template (Batch mode)  —  available variable: {core_text}  (context disabled in batch)")
             else:
                 info_label = QLabel("JSON Payload Template  —  available variables: {core_text}  {context_before}  {context_after}")
             info_label.setStyleSheet("font-weight: bold; color: #cc8800;")
             main_layout.addWidget(info_label)
-
+ 
             self.json_payload_edit = QTextEdit()
             variant = self._get_current_variant()
             cached_template = ""
@@ -5984,29 +6750,29 @@ class TranslatorApp(QMainWindow):
                 pass
             self.json_payload_edit.textChanged.connect(self.on_json_payload_content_changed)
             main_layout.addWidget(self.json_payload_edit)
-
-            for attr in ('ollama_prompt_edit', 'system_prompt_edit',
+ 
+            for attr in ('ollama_prompt_edit', 'single_prompt_edit', 'system_prompt_edit',
                          'assistant_prompt_edit', 'user_prompt_edit'):
                 if hasattr(self, attr):
                     delattr(self, attr)
-
+ 
             outer_splitter.addWidget(main_widget)
-
+ 
         else:
             variant = self._get_current_variant()
             prompts = self._get_current_prompts_from_cache(variant)
             llm_choice = self.app_settings.get("llm_choice", "LM Studio")
-
+ 
             if llm_choice == "Ollama":
                 main_widget = QWidget()
                 main_layout = QVBoxLayout(main_widget)
                 main_layout.setContentsMargins(0, 0, 0, 0)
                 main_layout.setSpacing(4)
-
+ 
                 label = QLabel("Full Ollama Prompt (system + context + user):")
                 label.setStyleSheet("font-weight: bold; color: #0066cc;")
                 main_layout.addWidget(label)
-
+ 
                 self.ollama_prompt_edit = QTextEdit()
                 self.ollama_prompt_edit.setPlainText(prompts['ollama'])
                 try:
@@ -6015,17 +6781,54 @@ class TranslatorApp(QMainWindow):
                     pass
                 self.ollama_prompt_edit.textChanged.connect(self.on_ollama_prompt_changed)
                 main_layout.addWidget(self.ollama_prompt_edit)
-
-                for attr in ('system_prompt_edit', 'assistant_prompt_edit',
-                             'user_prompt_edit', 'json_payload_edit'):
+ 
+                for attr in ('single_prompt_edit', 'system_prompt_edit',
+                             'assistant_prompt_edit', 'user_prompt_edit', 'json_payload_edit'):
                     if hasattr(self, attr):
                         delattr(self, attr)
-
+ 
                 outer_splitter.addWidget(main_widget)
-
+ 
+            elif is_single:
+                main_widget = QWidget()
+                main_layout = QVBoxLayout(main_widget)
+                main_layout.setContentsMargins(0, 0, 0, 0)
+                main_layout.setSpacing(4)
+ 
+                label = QLabel("Full Prompt (system + assistant + user merged):")
+                label.setStyleSheet("font-weight: bold; color: #0066cc;")
+                main_layout.addWidget(label)
+ 
+                self.single_prompt_edit = QTextEdit()
+ 
+                parts = []
+                if prompts.get('system', '').strip():
+                    parts.append(prompts['system'].strip())
+                asst_key = 'batch_assistant' if batch_mode else 'assistant'
+                if prompts.get(asst_key, '').strip():
+                    parts.append(prompts[asst_key].strip())
+                if prompts.get('user', '').strip():
+                    parts.append(prompts['user'].strip())
+                merged = "\n\n".join(parts) if parts else prompts.get('user', '')
+ 
+                self.single_prompt_edit.setPlainText(merged)
+                try:
+                    self.single_prompt_edit.textChanged.disconnect()
+                except:
+                    pass
+                self.single_prompt_edit.textChanged.connect(self.on_single_prompt_content_changed)
+                main_layout.addWidget(self.single_prompt_edit)
+ 
+                for attr in ('ollama_prompt_edit', 'system_prompt_edit',
+                             'assistant_prompt_edit', 'user_prompt_edit', 'json_payload_edit'):
+                    if hasattr(self, attr):
+                        delattr(self, attr)
+ 
+                outer_splitter.addWidget(main_widget)
+ 
             else:
                 horiz_splitter = QSplitter(Qt.Orientation.Horizontal)
-
+ 
                 system_container = QWidget()
                 system_layout = QVBoxLayout(system_container)
                 system_layout.setContentsMargins(0, 0, 0, 0)
@@ -6041,7 +6844,7 @@ class TranslatorApp(QMainWindow):
                 self.system_prompt_edit.textChanged.connect(self.on_system_prompt_changed)
                 system_layout.addWidget(self.system_prompt_edit)
                 horiz_splitter.addWidget(system_container)
-
+ 
                 assistant_container = QWidget()
                 assistant_layout = QVBoxLayout(assistant_container)
                 assistant_layout.setContentsMargins(0, 0, 0, 0)
@@ -6058,7 +6861,7 @@ class TranslatorApp(QMainWindow):
                 self.assistant_prompt_edit.textChanged.connect(self.on_assistant_prompt_changed)
                 assistant_layout.addWidget(self.assistant_prompt_edit)
                 horiz_splitter.addWidget(assistant_container)
-
+ 
                 user_container = QWidget()
                 user_layout = QVBoxLayout(user_container)
                 user_layout.setContentsMargins(0, 0, 0, 0)
@@ -6074,26 +6877,26 @@ class TranslatorApp(QMainWindow):
                 self.user_prompt_edit.textChanged.connect(self.on_user_prompt_changed)
                 user_layout.addWidget(self.user_prompt_edit)
                 horiz_splitter.addWidget(user_container)
-
-                for attr in ('ollama_prompt_edit', 'json_payload_edit'):
+ 
+                for attr in ('ollama_prompt_edit', 'single_prompt_edit', 'json_payload_edit'):
                     if hasattr(self, attr):
                         delattr(self, attr)
-
+ 
                 outer_splitter.addWidget(horiz_splitter)
-
+ 
         if batch_mode:
             batch_widget = QWidget()
             batch_layout = QVBoxLayout(batch_widget)
             batch_layout.setContentsMargins(0, 4, 0, 0)
             batch_layout.setSpacing(4)
-
+ 
             lbl = QLabel(
                 "Batch Hint  —  appended to prompt when Sentence batching is ON  "
                 "(variables: {n} = segment count, {marker_count} = n−1):"
             )
             lbl.setStyleSheet("font-weight: bold; color: #aa44cc;")
             batch_layout.addWidget(lbl)
-
+ 
             self.batch_hint_edit = QTextEdit()
             variant = self._get_current_variant()
             cached = ""
@@ -6108,12 +6911,12 @@ class TranslatorApp(QMainWindow):
                 pass
             self.batch_hint_edit.textChanged.connect(self.on_batch_hint_changed)
             batch_layout.addWidget(self.batch_hint_edit)
-
+ 
             outer_splitter.addWidget(batch_widget)
             outer_splitter.setSizes([300, 160])
         elif hasattr(self, 'batch_hint_edit'):
             delattr(self, 'batch_hint_edit')
-
+ 
         self.llm_editor_layout.addWidget(outer_splitter)
 
     def on_batch_hint_changed(self):
@@ -6188,6 +6991,31 @@ class TranslatorApp(QMainWindow):
 
         logger.debug(f"User prompt updated in cache (variant: {variant})")
 
+    def _on_single_prompt_toggled(self, state):
+        if self.llm_editor_container.isVisible():
+            self.update_llm_editor_content()
+
+    def on_single_prompt_content_changed(self):
+        if not hasattr(self, 'single_prompt_edit'):
+            return
+
+        variant = self._get_current_variant()
+        if not variant:
+            return
+
+        if variant not in self.current_prompts_cache:
+            self.current_prompts_cache[variant] = {}
+
+        batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
+        content = self.single_prompt_edit.toPlainText()
+        self.current_prompts_cache[variant]['user'] = content
+        self.current_prompts_cache[variant]['system'] = ''
+        self.current_prompts_cache[variant]['assistant'] = ''
+        if batch_mode:
+            self.current_prompts_cache[variant]['batch_assistant'] = ''
+
+        logger.debug(f"Single-prompt content updated in cache (variant: {variant})")
+
     def _on_json_payload_toggled(self, state):
         is_json = bool(state)
         self.json_response_field_label.setVisible(is_json)
@@ -6196,7 +7024,9 @@ class TranslatorApp(QMainWindow):
             self.single_prompt_checkbox.setVisible(False)
         else:
             has_file = bool(self.original_file_path)
-            self.single_prompt_checkbox.setVisible(has_file)
+            llm_choice = self.app_settings.get('llm_choice', 'LM Studio')
+            is_ollama = llm_choice == "Ollama"
+            self.single_prompt_checkbox.setVisible(has_file and not is_ollama)
         if self.llm_editor_container.isVisible():
             self.update_llm_editor_content()
         self._update_context_visibility()
@@ -6266,11 +7096,27 @@ class TranslatorApp(QMainWindow):
             prompts = self.current_prompts_cache[variant]
             llm_choice = self.app_settings.get("llm_choice", "LM Studio")
             batch_mode = hasattr(self, 'sentence_batch_checkbox') and self.sentence_batch_checkbox.isChecked()
+            is_single = self.single_prompt_checkbox.isChecked()
 
             if llm_choice == "Ollama":
                 if 'ollama' in prompts:
                     self.prompt_manager.save_prompt(variant, 'ollama', prompts['ollama'])
                     logger.info(f"Saved Ollama prompt to file: {variant}")
+            elif is_single:
+                if not hasattr(self, 'single_prompt_edit'):
+                    self.show_message("No Changes", "Single prompt editor not found.", QMessageBox.Icon.Warning)
+                    return
+                content = self.single_prompt_edit.toPlainText()
+                self.prompt_manager.save_prompt(variant, 'user', content)
+                self.prompt_manager.save_prompt(variant, 'system', '')
+                self.prompt_manager.save_prompt(variant, 'assistant', '')
+                if batch_mode:
+                    self.prompt_manager.save_prompt(variant, 'batch_assistant', '')
+                    self.current_prompts_cache[variant]['batch_assistant'] = ''
+                self.current_prompts_cache[variant]['user'] = content
+                self.current_prompts_cache[variant]['system'] = ''
+                self.current_prompts_cache[variant]['assistant'] = ''
+                logger.info(f"Saved single-prompt to file: {variant}")
             else:
                 if 'system' in prompts:
                     self.prompt_manager.save_prompt(variant, 'system', prompts['system'])
@@ -6331,7 +7177,14 @@ class TranslatorApp(QMainWindow):
             self._json_payload_content = ''
             self.json_response_field_edit.setText('')
             self.app_settings['json_response_field'] = ''
+
+            self.json_payload_checkbox.blockSignals(True)
             self.json_payload_checkbox.setChecked(False)
+            self.json_payload_checkbox.blockSignals(False)
+
+            self.single_prompt_checkbox.blockSignals(True)
+            self.single_prompt_checkbox.setChecked(False)
+            self.single_prompt_checkbox.blockSignals(False)
 
             logger.info(f"Reset prompts to factory defaults in cache: {variant}")
             self.update_llm_editor_content()
@@ -6380,7 +7233,14 @@ class TranslatorApp(QMainWindow):
             self._json_payload_content = ''
             self.json_response_field_edit.setText('')
             self.app_settings['json_response_field'] = ''
+
+            self.json_payload_checkbox.blockSignals(True)
             self.json_payload_checkbox.setChecked(False)
+            self.json_payload_checkbox.blockSignals(False)
+
+            self.single_prompt_checkbox.blockSignals(True)
+            self.single_prompt_checkbox.setChecked(False)
+            self.single_prompt_checkbox.blockSignals(False)
 
             self.update_llm_editor_content()
 
@@ -6390,6 +7250,29 @@ class TranslatorApp(QMainWindow):
                 f"Factory defaults restored: {variant}"
             )
 
+    def _apply_quote_style_to_all_translated(self, quote_style: str):
+        if not hasattr(self, 'paragraphs') or not self.paragraphs:
+            return
+        pair = QUOTE_STYLE_OPTIONS.get(quote_style, ('"', '"'))
+        open_char, close_char = pair
+        for para in self.paragraphs:
+            if not para.get('is_translated'):
+                continue
+            if para.get('manually_edited'):
+                continue
+            text = para.get('translated_text', '')
+            if not text:
+                continue
+            para['translated_text'] = apply_quote_style_to_text(text, open_char, close_char)
+        self._refresh_current_fragment_display()
+        if hasattr(self, 'list_widget'):
+            for i in range(self.list_widget.count()):
+                item = self.list_widget.item(i)
+                if item:
+                    idx = item.data(Qt.ItemDataRole.UserRole)
+                    if idx is not None:
+                        self._update_item_visuals(idx)
+
     def save_app_settings(self):
         try:
             settings = self.app_settings.copy()
@@ -6397,6 +7280,7 @@ class TranslatorApp(QMainWindow):
             settings["server_url"] = self.server_url_edit.text().strip()
             if settings["llm_choice"] == "Ollama":
                 settings["ollama_model_name"] = self.ollama_model_edit.text()
+                settings["ollama_server_url"] = self.ollama_server_url_edit.text().strip()
             elif settings["llm_choice"] == "Openrouter":
                 settings["openrouter_api_key"] = self.openrouter_api_key_edit.text()
                 settings["openrouter_model_name"] = self.openrouter_model_edit.text()
@@ -6405,7 +7289,11 @@ class TranslatorApp(QMainWindow):
             settings["use_inline_formatting"] = self.inline_formatting_checkbox.isChecked()
             settings["restore_paragraph_structure"] = self.restore_paragraph_checkbox.isChecked()
             settings["show_ps_in_ui"] = self.show_ps_in_ui_checkbox.isChecked()
-            for obsolete in ("use_ps_markers", "restore_paragraph_epub", "restore_paragraph_txt"):
+            old_quote_style = self.app_settings.get('quote_style', 'neutral')
+            new_quote_style = self.quote_style_combo.currentData()
+            settings["quote_style"] = new_quote_style
+            for obsolete in ("use_ps_markers", "restore_paragraph_epub", "restore_paragraph_txt",
+                             "use_source_quote_style"):
                 settings.pop(obsolete, None)
             skip_inline_tags = {}
             for tag, checkbox in self.skip_inline_checkboxes.items():
@@ -6439,6 +7327,8 @@ class TranslatorApp(QMainWindow):
             AppSettingsManager.save_settings(settings)
             self.app_settings = settings
             self._initialize_components()
+            if new_quote_style != old_quote_style:
+                self._apply_quote_style_to_all_translated(new_quote_style)
             self._refresh_alignment_status(model_name_input)
             QMessageBox.information(
                 self, "Settings Saved", "Settings have been saved successfully."
@@ -6534,19 +7424,25 @@ class TranslatorApp(QMainWindow):
             self._refresh_alignment_status(model_name)
 
     def update_model_name_visibility(self, llm_choice):
-        is_ollama = llm_choice == "Ollama"
+        is_ollama     = llm_choice == "Ollama"
         is_openrouter = llm_choice == "Openrouter"
-        is_local = llm_choice == "LM Studio"
-
+        is_local      = llm_choice == "LM Studio"
+ 
         self.server_url_label.setVisible(is_local)
         self.server_url_edit.setVisible(is_local)
         self.ollama_model_label.setVisible(is_ollama)
         self.ollama_model_edit.setVisible(is_ollama)
+        self.ollama_server_url_label.setVisible(is_ollama)
+        self.ollama_server_url_edit.setVisible(is_ollama)
         self.openrouter_api_key_label.setVisible(is_openrouter)
         self.openrouter_api_key_edit.setVisible(is_openrouter)
         self.openrouter_model_label.setVisible(is_openrouter)
         self.openrouter_model_edit.setVisible(is_openrouter)
         self.openrouter_free_warning.setVisible(is_openrouter)
+ 
+        has_file = bool(self.original_file_path)
+        is_json = self.json_payload_checkbox.isChecked()
+        self.single_prompt_checkbox.setVisible(has_file and not is_ollama and not is_json)
 
     def _toggle_processing_mode(self, checked):
         new_mode = 'inline' if checked else 'legacy'
@@ -6564,6 +7460,7 @@ class TranslatorApp(QMainWindow):
             self._initialize_components()
             if self.llm_editor_container.isVisible():
                 self.update_llm_editor_content()
+            self._update_alignment_button_visibility()
             return
 
         translated_count = sum(1 for p in self.paragraphs if p.get('is_translated', False))
@@ -6621,6 +7518,7 @@ class TranslatorApp(QMainWindow):
             self.alignment_section_widget.setVisible(loaded_mode != 'inline')
             if self.llm_editor_container.isVisible():
                 self.update_llm_editor_content()
+            self._update_alignment_button_visibility()
             return
 
         elif clicked == btn_reload:
@@ -6643,6 +7541,7 @@ class TranslatorApp(QMainWindow):
             self.update_file_label()
             if self.llm_editor_container.isVisible():
                 self.update_llm_editor_content()
+            self._update_alignment_button_visibility()
 
     def _reload_current_file(self, file_path):
         if not file_path or not os.path.exists(file_path):
@@ -6691,14 +7590,10 @@ class TranslatorApp(QMainWindow):
                 raise TypeError(f"Invalid paragraph format: {type(self.paragraphs[0])}")
 
             self._initialize_components()
-
             self.populate_list()
             self.update_file_label()
-
             self.update_llm_editor_content()
-
-            mode_str = 'inline' if self.inline_formatting_checkbox.isChecked() else 'legacy'
-            logger.info(f"File reloaded successfully with mode: {mode_str}")
+            self._update_status_after_file_load()
 
         except Exception as e:
             logging.error(f"Failed to reload file: {e}")
@@ -6792,7 +7687,6 @@ class TranslatorApp(QMainWindow):
     def _get_current_variant(self):
         if not self.file_type:
             return None
-
         if self.file_type == "txt":
             return "txt"
         elif self.file_type == "srt":
@@ -6802,7 +7696,16 @@ class TranslatorApp(QMainWindow):
             variant = "epub_inline" if use_inline else "epub_legacy"
             logger.debug(f"Current variant: {variant} (checkbox: {use_inline})")
             return variant
-
+        elif self.file_type in ("mobi", "fb2", "docx"):
+            if not self.paragraphs:
+                return "txt"
+            first_mode = self.paragraphs[0].get('processing_mode', 'inline')
+            if first_mode == 'legacy':
+                return "epub_legacy"
+            has_inline = any(p.get('inline_formatting_map') for p in self.paragraphs)
+            return "epub_inline" if has_inline else "txt"
+        elif self.file_type == "pdf":
+            return "txt"
         return None
 
     def _get_context(self, idx, before=True, count=3):
@@ -7144,6 +8047,11 @@ class TranslatorApp(QMainWindow):
             if self.epub_creator.isRunning():
                 self.epub_creator.terminate()
                 self.epub_creator.wait(5000)
+
+        if hasattr(self, 'pdf_creator') and self.pdf_creator:
+            if self.pdf_creator.isRunning():
+                self.pdf_creator.terminate()
+                self.pdf_creator.wait(5000)
 
         if hasattr(self, 'srt_creator') and self.srt_creator:
             if self.srt_creator.isRunning():
