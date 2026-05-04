@@ -27,7 +27,15 @@ class SessionManager:
         json_payload_template: str = "",
         json_response_field: str = "",
         sentence_batch_enabled: bool = False,
-        sentence_batch_size: int = 5
+        sentence_batch_size: int = 5,
+        auto_fix_enabled: bool = False,
+        auto_fix_attempts: int = 3,
+        top_p: float = 0.0,
+        top_k: int = 0,
+        timeout_minutes: int = 10,
+        source_lang: str = "",
+        target_lang: str = "",
+        quick_translate_service: str = "Google (Free)"
     ) -> None:
         _NON_SERIALISABLE = frozenset({
             'auto_fix_history',
@@ -69,6 +77,14 @@ class SessionManager:
             'json_response_field': json_response_field,
             'sentence_batch_enabled': sentence_batch_enabled,
             'sentence_batch_size': sentence_batch_size,
+            'auto_fix_enabled': auto_fix_enabled,
+            'auto_fix_attempts': auto_fix_attempts,
+            'top_p': top_p,
+            'top_k': top_k,
+            'timeout_minutes': timeout_minutes,
+            'source_lang': source_lang,
+            'target_lang': target_lang,
+            'quick_translate_service': quick_translate_service,
 
             'metadata': {
                 'processing_mode': processing_mode,
@@ -78,7 +94,6 @@ class SessionManager:
         }
 
         def _json_default(obj):
-            """Fallback serialiser: convert unknowns to their string repr."""
             try:
                 from lxml import etree as _et
                 if isinstance(obj, _et._Element):
@@ -114,7 +129,6 @@ class SessionManager:
 
             if skip_inline_tags is None and 'skip_spans' in metadata:
                 old_skip_spans = metadata.get('skip_spans', False)
-
                 skip_inline_tags = {'span': old_skip_spans} if old_skip_spans else {}
                 logger.info(f"Converted old skip_spans={old_skip_spans} to skip_inline_tags={skip_inline_tags}")
             elif skip_inline_tags is None:
@@ -148,6 +162,14 @@ class SessionManager:
                 'json_response_field': session_data.get('json_response_field', ''),
                 'sentence_batch_enabled': session_data.get('sentence_batch_enabled', False),
                 'sentence_batch_size': session_data.get('sentence_batch_size', 5),
+                'auto_fix_enabled': session_data.get('auto_fix_enabled', False),
+                'auto_fix_attempts': session_data.get('auto_fix_attempts', 3),
+                'top_p': session_data.get('top_p', 0.0),
+                'top_k': session_data.get('top_k', 0),
+                'timeout_minutes': session_data.get('timeout_minutes', 10),
+                'source_lang': session_data.get('source_lang', ''),
+                'target_lang': session_data.get('target_lang', ''),
+                'quick_translate_service': session_data.get('quick_translate_service', 'Google (Free)'),
                 'metadata': {
                     'processing_mode': processing_mode,
                     'prompt_variant': prompt_variant,
@@ -201,9 +223,10 @@ class SessionManager:
             key = (item_href, text)
             if key in session_map:
                 para = session_map[key]
-
-                element.set('id', para['id'])
-                logger.debug(f"Restored ID: {para['id']} for text: {text[:50]}...")
+                element_id = para.get('id')
+                if element_id is not None:
+                    element.set('id', element_id)
+                    logger.debug(f"Restored ID: {element_id} for text: {text[:50]}...")
 
             SessionManager.restore_epub_ids(element, item_href, session_map, namespaces)
 
@@ -225,6 +248,7 @@ class AppSettingsManager:
         "server_url": "",
         "json_response_field": "",
         "ollama_model_name": "",
+        "ollama_server_url": "",
         "openrouter_api_key": "",
         "openrouter_model_name": "",
         "ollama_endpoint": "http://localhost:11434",
@@ -233,6 +257,7 @@ class AppSettingsManager:
         "use_inline_formatting": True,
         "restore_paragraph_structure": True,
         "show_ps_in_ui": False,
+        "quote_style": "neutral",
         "skip_inline_tags": {},
         "mismatch_checks": {
             "paragraphs": True,
@@ -286,6 +311,10 @@ class AppSettingsManager:
                 del settings[obsolete]
                 logger.info(f"Removed obsolete key: {obsolete}")
 
+        _aliases = {'swiss': 'french', 'russian': 'french'}
+        if settings.get('quote_style') in _aliases:
+            settings['quote_style'] = _aliases[settings['quote_style']]
+
         for nested_key in (
             "mismatch_checks",
             "mismatch_thresholds",
@@ -329,6 +358,10 @@ class AppSettingsManager:
         for obsolete in ('use_ps_markers', 'restore_paragraph_epub', 'restore_paragraph_txt'):
             validated_settings.pop(obsolete, None)
 
+        _aliases = {'swiss': 'french', 'russian': 'french'}
+        if validated_settings.get('quote_style') in _aliases:
+            validated_settings['quote_style'] = _aliases[validated_settings['quote_style']]
+
         try:
             with open(AppSettingsManager.SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(validated_settings, f, ensure_ascii=False, indent=2)
@@ -352,7 +385,7 @@ class AppSettingsManager:
         else:
             model_name = 'local-model'
             api_key = None
-            endpoint = 'http://localhost:1234/v1'
+            endpoint = settings.get('server_url', 'http://localhost:1234/v1') or 'http://localhost:1234/v1'
 
         return {
             'llm_choice': llm_choice,
@@ -632,108 +665,160 @@ Return format:
 
     @staticmethod
     def get_default_json_payload_prompt(variant: str) -> str:
-        base_instructions = (
-            "Translate the following text to Polish.\n"
-            'Return ONLY valid JSON in this exact format: {"translation":"..."}\n'
-            "Do not add any explanations, comments, markdown or extra text outside the JSON.\n\n"
-        )
-
         if variant == "txt":
             variant_instructions = (
-                "Preserve natural paragraph breaks and text structure.\n"
-                "Keep URLs, emails and proper nouns as-is.\n"
-                "Maintain the author's meaning and natural Polish flow.\n\n"
+                "Translate the following text to Polish.\\n"
+                "Preserve natural paragraph breaks and text structure.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n"
+                "Maintain the author's meaning and natural Polish flow.\\n\\n"
+                "Context before (for reference only, do NOT translate):\\n"
+                "{context_before}\\n\\n"
+                "Text to translate:\\n"
+                "{core_text}\\n\\n"
+                "Context after (for reference only, do NOT translate):\\n"
+                "{context_after}"
             )
         elif variant == "srt":
             variant_instructions = (
-                "LINE PRESERVATION: maintain line breaks (\\n) from the original.\n"
-                "If the original has 2 lines, the translation must have exactly 2 lines.\n"
-                "Keep dialogue dashes (- ) at line start if present in original.\n"
-                "Keep URLs, emails and proper nouns as-is.\n\n"
+                "Translate the following text to Polish.\\n"
+                "LINE PRESERVATION: maintain line breaks (\\\\n) from the original.\\n"
+                "If the original has 2 lines, the translation must have exactly 2 lines.\\n"
+                "Keep dialogue dashes (- ) at line start if present in original.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+                "Context before (for reference only, do NOT translate):\\n"
+                "{context_before}\\n\\n"
+                "Text to translate:\\n"
+                "{core_text}\\n\\n"
+                "Context after (for reference only, do NOT translate):\\n"
+                "{context_after}"
             )
         elif variant == "epub_legacy":
             variant_instructions = (
-                "RESERVE ELEMENTS — copy exactly, keep approximate position:\n"
-                "  <id_00>, <id_01>, ... — images, <br> tags, non-translatable elements.\n"
-                "Do NOT modify or remove them.\n"
-                "Keep URLs, emails and proper nouns as-is.\n\n"
+                "Translate the following text to Polish.\\n"
+                "RESERVE ELEMENTS — copy exactly, keep approximate position:\\n"
+                "  <id_00>, <id_01>, ... — images, <br> tags, non-translatable elements.\\n"
+                "Do NOT modify or remove them.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+                "Context before (for reference only, do NOT translate):\\n"
+                "{context_before}\\n\\n"
+                "Text to translate:\\n"
+                "{core_text}\\n\\n"
+                "Context after (for reference only, do NOT translate):\\n"
+                "{context_after}"
             )
         elif variant == "epub_inline":
             variant_instructions = (
-                "PLACEHOLDERS — copy all exactly and preserve their positions:\n"
-                "  <id_00>, <id_01>... — images/<br>/structural (do NOT modify)\n"
-                "  <p_00>...</p_00>... — inline formatting (<i>/<b>/etc.); every opening needs matching closing\n"
-                "  <nt_00/>, <nt_01/>... — non-translatable anchors (self-closing, do NOT move)\n"
-                "  <ps> — paragraph break; count in translation must match original EXACTLY\n"
-                "NEVER use raw HTML tags like <i>, <b>, <em> — use only <p_XX> placeholders.\n"
-                "Keep URLs, emails and proper nouns as-is.\n\n"
+                "Translate the following text to Polish.\\n"
+                "PLACEHOLDERS — copy all exactly and preserve their positions:\\n"
+                "  <id_00>, <id_01>... — images/<br>/structural (do NOT modify)\\n"
+                "  <p_00>...</p_00>... — inline formatting (<i>/<b>/etc.); every opening needs matching closing\\n"
+                "  <nt_00/>, <nt_01/>... — non-translatable anchors (self-closing, do NOT move)\\n"
+                "  <ps> — paragraph break; count in translation must match original EXACTLY\\n"
+                "NEVER use raw HTML tags like <i>, <b>, <em> — use only <p_XX> placeholders.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+                "Context before (for reference only, do NOT translate):\\n"
+                "{context_before}\\n\\n"
+                "Text to translate:\\n"
+                "{core_text}\\n\\n"
+                "Context after (for reference only, do NOT translate):\\n"
+                "{context_after}"
             )
         else:
-            variant_instructions = ""
-
+            variant_instructions = (
+                "Translate the following text to Polish.\\n\\n"
+                "Context before (for reference only, do NOT translate):\\n"
+                "{context_before}\\n\\n"
+                "Text to translate:\\n"
+                "{core_text}\\n\\n"
+                "Context after (for reference only, do NOT translate):\\n"
+                "{context_after}"
+            )
+ 
         return (
-            base_instructions
-            + variant_instructions
-            + "Context before (for reference only, do NOT translate):\n"
-            "{context_before}\n\n"
-            "Text to translate:\n"
-            "{core_text}\n\n"
-            "Context after (for reference only, do NOT translate):\n"
-            "{context_after}"
+            '[\n'
+            '  {\n'
+            '    "type": "text",\n'
+            '    "text": "' + variant_instructions + '"\n'
+            '  }\n'
+            ']'
         )
-
+ 
     @staticmethod
     def get_default_json_response_field(variant: str) -> str:
         return ""
-
+ 
     @staticmethod
     def get_default_batch_json_payload_prompt(variant: str) -> str:
-        base_instructions = (
-            "Translate the following text segments to Polish.\n"
-            "The segments are separated by <z> markers.\n"
-            'Return ONLY valid JSON in this exact format: {"translation":"..."}\n'
-            "In the translation field, preserve ALL <z> markers in the same positions — "
-            "there must be exactly the same number of <z> markers as in the input.\n"
-            "Do not add any explanations, comments, markdown or extra text outside the JSON.\n\n"
-        )
-
         if variant == "txt":
             variant_instructions = (
-                "Preserve natural paragraph breaks and text structure.\n"
-                "Keep URLs, emails and proper nouns as-is.\n"
-                "Maintain the author's meaning and natural Polish flow.\n\n"
+                "Translate the following text segments to Polish.\\n"
+                "The segments are separated by <z> markers.\\n"
+                "Preserve ALL <z> markers in the same positions — "
+                "there must be exactly the same number of <z> markers as in the input.\\n"
+                "Preserve natural paragraph breaks and text structure.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n"
+                "Maintain the author's meaning and natural Polish flow.\\n\\n"
+                "Text segments to translate (separated by <z>):\\n"
+                "{core_text}"
             )
         elif variant == "srt":
             variant_instructions = (
-                "LINE PRESERVATION: maintain line breaks (\\n) from the original.\n"
-                "Keep dialogue dashes (- ) at line start if present in original.\n"
-                "Keep URLs, emails and proper nouns as-is.\n\n"
+                "Translate the following text segments to Polish.\\n"
+                "The segments are separated by <z> markers.\\n"
+                "Preserve ALL <z> markers in the same positions — "
+                "there must be exactly the same number of <z> markers as in the input.\\n"
+                "LINE PRESERVATION: maintain line breaks (\\\\n) from the original.\\n"
+                "Keep dialogue dashes (- ) at line start if present in original.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+                "Text segments to translate (separated by <z>):\\n"
+                "{core_text}"
             )
         elif variant == "epub_legacy":
             variant_instructions = (
-                "RESERVE ELEMENTS — copy exactly, keep approximate position:\n"
-                "  <id_00>, <id_01>, ... — images, <br> tags, non-translatable elements.\n"
-                "Do NOT modify or remove them.\n"
-                "Keep URLs, emails and proper nouns as-is.\n\n"
+                "Translate the following text segments to Polish.\\n"
+                "The segments are separated by <z> markers.\\n"
+                "Preserve ALL <z> markers in the same positions — "
+                "there must be exactly the same number of <z> markers as in the input.\\n"
+                "RESERVE ELEMENTS — copy exactly, keep approximate position:\\n"
+                "  <id_00>, <id_01>, ... — images, <br> tags, non-translatable elements.\\n"
+                "Do NOT modify or remove them.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+                "Text segments to translate (separated by <z>):\\n"
+                "{core_text}"
             )
         elif variant == "epub_inline":
             variant_instructions = (
-                "PLACEHOLDERS — copy all exactly and preserve their positions:\n"
-                "  <id_00>, <id_01>... — images/<br>/structural (do NOT modify)\n"
-                "  <p_00>...</p_00>... — inline formatting (<i>/<b>/etc.); every opening needs matching closing\n"
-                "  <nt_00/>, <nt_01/>... — non-translatable anchors (self-closing, do NOT move)\n"
-                "  <ps> — paragraph break; count in translation must match original EXACTLY\n"
-                "NEVER use raw HTML tags like <i>, <b>, <em> — use only <p_XX> placeholders.\n"
-                "Keep URLs, emails and proper nouns as-is.\n\n"
+                "Translate the following text segments to Polish.\\n"
+                "The segments are separated by <z> markers.\\n"
+                "Preserve ALL <z> markers in the same positions — "
+                "there must be exactly the same number of <z> markers as in the input.\\n"
+                "PLACEHOLDERS — copy all exactly and preserve their positions:\\n"
+                "  <id_00>, <id_01>... — images/<br>/structural (do NOT modify)\\n"
+                "  <p_00>...</p_00>... — inline formatting (<i>/<b>/etc.); every opening needs matching closing\\n"
+                "  <nt_00/>, <nt_01/>... — non-translatable anchors (self-closing, do NOT move)\\n"
+                "  <ps> — paragraph break; count in translation must match original EXACTLY\\n"
+                "NEVER use raw HTML tags like <i>, <b>, <em> — use only <p_XX> placeholders.\\n"
+                "Keep URLs, emails and proper nouns as-is.\\n\\n"
+                "Text segments to translate (separated by <z>):\\n"
+                "{core_text}"
             )
         else:
-            variant_instructions = ""
-
+            variant_instructions = (
+                "Translate the following text segments to Polish.\\n"
+                "The segments are separated by <z> markers.\\n"
+                "Preserve ALL <z> markers in the same positions — "
+                "there must be exactly the same number of <z> markers as in the input.\\n\\n"
+                "Text segments to translate (separated by <z>):\\n"
+                "{core_text}"
+            )
+ 
         return (
-            base_instructions
-            + variant_instructions
-            + "Text segments to translate (separated by <z>):\n"
-            "{core_text}"
+            '[\n'
+            '  {\n'
+            '    "type": "text",\n'
+            '    "text": "' + variant_instructions + '"\n'
+            '  }\n'
+            ']'
         )
     
     @staticmethod
@@ -754,39 +839,34 @@ Return format:
         variant: str,
         system: str = None,
         assistant: str = None,
+        batch_assistant: str = None,
         user: str = None,
-        ollama: str = None
+        ollama: str = None,
+        json_payload: str = None,
+        batch_json_payload: str = None,
+        batch_hint: str = None,
     ) -> List[str]:
         saved_files = []
 
+        prompts_map = {
+            'system':             system,
+            'assistant':          assistant,
+            'batch_assistant':    batch_assistant,
+            'user':               user,
+            'ollama':             ollama,
+            'json_payload':       json_payload,
+            'batch_json_payload': batch_json_payload,
+            'batch_hint':         batch_hint,
+        }
+
         try:
-            if system is not None:
-                filename = f"llm_prompt_system_{variant}.txt"
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(system)
-                saved_files.append(filename)
-                logger.info(f"Saved: {filename}")
-
-            if assistant is not None:
-                filename = f"llm_prompt_assistant_{variant}.txt"
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(assistant)
-                saved_files.append(filename)
-                logger.info(f"Saved: {filename}")
-
-            if user is not None:
-                filename = f"llm_prompt_user_{variant}.txt"
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(user)
-                saved_files.append(filename)
-                logger.info(f"Saved: {filename}")
-
-            if ollama is not None:
-                filename = f"llm_prompt_ollama_{variant}.txt"
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(ollama)
-                saved_files.append(filename)
-                logger.info(f"Saved: {filename}")
+            for role, content in prompts_map.items():
+                if content is not None:
+                    filename = f"llm_prompt_{role}_{variant}.txt"
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    saved_files.append(filename)
+                    logger.info(f"Saved: {filename}")
 
             return saved_files
 
