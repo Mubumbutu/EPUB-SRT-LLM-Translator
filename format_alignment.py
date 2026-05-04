@@ -49,14 +49,6 @@ def download_model(
     model_name: str = 'xlm-roberta-large',
     models_dir: str = '',
 ) -> str:
-    try:
-        pass
-    except ImportError as exc:
-        raise ImportError(
-            "Missing package 'transformers'. "
-            "Install with: pip install transformers torch"
-        ) from exc
-
     if not models_dir:
         models_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), MODELS_SUBDIR
@@ -234,14 +226,6 @@ class FormatAlignmentEngine:
         self._last_sent_map: Dict[int, Tuple[int, int, int, int]] = {}
 
     def load_model(self) -> None:
-        try:
-            pass
-        except ImportError as exc:
-            raise ImportError(
-                "Missing package 'transformers'. "
-                "Install with: pip install transformers torch"
-            ) from exc
-
         local_path = get_local_model_path(self.model_name, self.local_models_dir)
 
         if is_model_downloaded(self.model_name, self.local_models_dir):
