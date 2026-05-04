@@ -23,13 +23,6 @@ class EPUBCreatorLxml(QThread):
         self.paragraphs = paragraphs
         self.output_path = output_path
 
-        self.position = 'only'
-        self.original_color = None
-        self.translation_color = None
-        self.target_direction = 'auto'
-        self.translation_lang = None
-        self.column_gap = None
-
         self.ns = {
             'x': 'http://www.w3.org/1999/xhtml'
         }
@@ -246,8 +239,19 @@ class EPUBCreatorLxml(QThread):
             self._restore_inline_translation(new_element, para)
 
         else:
-            logger.debug("Using legacy path via _create_clean_translation_element")
-            new_element = self._legacy_path(element, element_name, translation, para, root)
+            if len(element) == 0 and not re.search(r'<[^>]+>', translation):
+                logger.debug("Element has no children – setting text directly")
+                new_element = copy.deepcopy(element)
+                new_element.text = translation
+                original_id = element.get('id', '')
+                if original_id:
+                    if original_id.startswith('trans_'):
+                        new_element.set('id', original_id)
+                    else:
+                        new_element.set('id', f"trans_{original_id}")
+            else:
+                logger.debug("Using legacy path via _create_clean_translation_element")
+                new_element = self._legacy_path(element, element_name, translation, para, root)
 
         links_in_new = new_element.xpath('.//x:a', namespaces=self.ns)
         logger.debug(f"Links in NEW element: {len(links_in_new)}")
@@ -272,7 +276,7 @@ class EPUBCreatorLxml(QThread):
         translation = self._cleanup_translation(translation)
 
         translation = re.sub(r'(?<=[^\s>])(<a[\s>])', r' \1', translation)
-
+        translation = re.sub(r'(</[a-zA-Z0-9]+>)(<a[\s>])', r'\1 \2', translation)
         translation = re.sub(r'(</a>)(?=[^\s<,;:!?.\u2013\u2014\-])', r'\1 ', translation)
 
         return self._create_clean_translation_element(
@@ -323,19 +327,6 @@ class EPUBCreatorLxml(QThread):
             aligned_elem.set('id', f"trans_{clean_id}")
         else:
             aligned_elem.attrib.pop('id', None)
-
-        aligned_elem.set('dir', self.target_direction or 'auto')
-
-        if self.translation_lang:
-            aligned_elem.set('lang', self.translation_lang)
-
-        if self.translation_color:
-            style = aligned_elem.get('style', '').strip().rstrip(';')
-            color_style = f"color:{self.translation_color}"
-            if style:
-                aligned_elem.set('style', f"{style}; {color_style}")
-            else:
-                aligned_elem.set('style', color_style)
 
         if prefix_tags:
             prefix_html = ' '.join(prefix_tags)
@@ -427,7 +418,7 @@ class EPUBCreatorLxml(QThread):
         element.insert(0, new_span)
 
         logger.debug(
-            f"[create_drop_cap] Utworzono span.{class_attr}: "
+            f"[create_drop_cap] Created span.{class_attr}: "
             f"text='{first_char}', tail='{after_text[:40]}'"
         )
 
@@ -476,7 +467,7 @@ class EPUBCreatorLxml(QThread):
                 if parent is None:
                     continue
 
-                if parent.text == node:
+                if not node.is_tail:
                     location = 'text'
                 else:
                     location = 'tail'
@@ -605,7 +596,7 @@ class EPUBCreatorLxml(QThread):
         )
         translated_text = re.sub(
             r'[ \t\u00a0]+(</p_\d{2}>)',
-            r'\1',
+            r'\1 ',
             translated_text
         )
         translated_text = re.sub(
@@ -613,6 +604,7 @@ class EPUBCreatorLxml(QThread):
             r'\1',
             translated_text
         )
+        translated_text = re.sub(r'  +', ' ', translated_text)
         logger.debug(f"Applied FIX 10c (punctuation spacing cleanup)")
 
         _dup_pattern = r'(\b(\S+))(</(?:strong|em|b|i|u|small)>)\s*\2\b'
@@ -684,7 +676,12 @@ class EPUBCreatorLxml(QThread):
         if placeholders_missing:
             logger.warning(f"Translation text preview: {repr(translated_text[:150])}")
             logger.warning("🔧 FALLBACK: Attempting text-only replacement...")
-            self._fallback_text_only_replacement(element, translated_text)
+            clean_translated = re.sub(r'</?p_\d{2}>', '', translated_text)
+            clean_translated = re.sub(r'<id_\d{2}>', '', clean_translated)
+            clean_translated = re.sub(r'</id_\d{2}>', '', clean_translated)
+            clean_translated = re.sub(r'<nt_\d{2}/>', ' ', clean_translated)
+            clean_translated = re.sub(r'  +', ' ', clean_translated).strip()
+            self._fallback_text_only_replacement(element, clean_translated)
             if had_drop_cap:
                 self._fix_drop_cap_in_element(element)
             logger.debug("Fallback replacement complete")
@@ -715,8 +712,11 @@ class EPUBCreatorLxml(QThread):
                 full_text = full_text.replace(marker, original)
                 logger.debug(f"Restored non-translatable: {marker} → {original}")
             else:
-                full_text = full_text.rstrip() + original
+                full_text = full_text.rstrip() + ' ' + original
                 logger.warning(f"NT marker dropped by LLM, appended to end: {repr(original)}")
+
+        full_text = re.sub(r'(</[a-zA-Z0-9]+>)(<a[\s>])', r'\1 \2', full_text)
+        full_text = re.sub(r'(</a>)(?=[^\s<,;:!?.\u2013\u2014\-])', r'\1 ', full_text)
 
         element.text = ""
         for child in list(element):
@@ -745,24 +745,16 @@ class EPUBCreatorLxml(QThread):
 
     def _fallback_text_only_replacement(self, element, translated_text):
         logger.debug(f"\n=== FALLBACK: Text-only replacement ===")
-        logger.debug(f"Original text: {repr(translated_text[:100])}")
+        logger.debug(f"Input text: {repr(translated_text[:100])}")
 
-        clean_translated = re.sub(r'</?p_\d{2}>', '', translated_text)
-        clean_translated = re.sub(r'<id_\d{2}>', '', clean_translated)
-        clean_translated = re.sub(r'</id_\d{2}>', '', clean_translated)
-        clean_translated = re.sub(r'<nt_\d{2}/>', '', clean_translated)
-        clean_translated = re.sub(r'  +', ' ', clean_translated).strip()
-
-        logger.debug(f"Cleaned text:  {repr(clean_translated[:100])}")
+        SKIP_IN_FALLBACK = {'sub', 'sup', 'abbr', 'code', 'kbd', 'var'}
 
         original_text_nodes = element.xpath('.//text()')
 
         if not original_text_nodes:
-            element.text = clean_translated
+            element.text = translated_text
             logger.debug("No text nodes - set element.text directly")
             return
-
-        SKIP_IN_FALLBACK = {'sub', 'sup', 'abbr', 'code', 'kbd', 'var'}
 
         content_text_nodes = [
             n for n in original_text_nodes
@@ -774,7 +766,7 @@ class EPUBCreatorLxml(QThread):
         logger.debug(f"Content nodes: {len(content_text_nodes)}, whitespace-only: {len(whitespace_text_nodes)}")
 
         if not content_text_nodes:
-            element.text = clean_translated
+            element.text = translated_text
             logger.debug("No content nodes - set element.text directly")
             return
 
@@ -782,10 +774,21 @@ class EPUBCreatorLxml(QThread):
             parent = text_node.getparent()
             if parent is None:
                 continue
-            if parent.text == text_node:
+            if not text_node.is_tail:
                 parent.text = str(text_node)
             else:
                 parent.tail = str(text_node)
+
+        if len(content_text_nodes) == 1:
+            node = content_text_nodes[0]
+            parent = node.getparent()
+            if parent is not None:
+                if not node.is_tail:
+                    parent.text = translated_text
+                else:
+                    parent.tail = translated_text
+            logger.debug(f"Single content node replacement: {repr(translated_text[:80])}")
+            return
 
         total_original_len = sum(len(str(node).strip()) for node in content_text_nodes)
 
@@ -793,18 +796,18 @@ class EPUBCreatorLxml(QThread):
             first = content_text_nodes[0]
             parent = first.getparent()
             if parent is not None:
-                if parent.text == first:
-                    parent.text = clean_translated
+                if not first.is_tail:
+                    parent.text = translated_text
                 else:
-                    parent.tail = clean_translated
+                    parent.tail = translated_text
             return
 
         logger.debug(
-            f"Distributing {len(clean_translated)} chars "
+            f"Distributing {len(translated_text)} chars "
             f"across {len(content_text_nodes)} content nodes"
         )
 
-        remaining_text = clean_translated
+        remaining_text = translated_text
 
         for idx, text_node in enumerate(content_text_nodes):
             parent = text_node.getparent()
@@ -812,7 +815,7 @@ class EPUBCreatorLxml(QThread):
             if parent is None:
                 continue
 
-            if parent.text == text_node:
+            if not text_node.is_tail:
                 location = 'text'
             else:
                 location = 'tail'
@@ -822,7 +825,7 @@ class EPUBCreatorLxml(QThread):
             else:
                 original_stripped_len = len(str(text_node).strip())
                 ratio = original_stripped_len / total_original_len
-                target_len = int(len(clean_translated) * ratio)
+                target_len = int(len(translated_text) * ratio)
 
                 if target_len < len(remaining_text):
                     space_pos = remaining_text.rfind(
@@ -891,15 +894,6 @@ class EPUBCreatorLxml(QThread):
             if clean_id.startswith('trans_'):
                 clean_id = clean_id[len('trans_'):]
             new_element.set('id', f"trans_{clean_id}")
-
-        new_element.set('dir', self.target_direction or 'auto')
-
-        if self.translation_lang:
-            new_element.set('lang', self.translation_lang)
-
-        if self.translation_color:
-            style = new_element.get('style', '')
-            new_element.set('style', f"{style}; color:{self.translation_color}".strip('; '))
 
         has_html = bool(re.search(r'<[^>]+>', translation))
         logger.debug(f"    has_html: {has_html}")
@@ -1024,7 +1018,6 @@ class EPUBCreatorLxml(QThread):
         else:
             logger.debug("No links found - replacing content entirely")
             element.text = None
-            element.tail = element.tail
             for child in list(element):
                 element.remove(child)
 
@@ -2011,7 +2004,7 @@ class EPUBCreatorLxml(QThread):
             element.text = text
             return
 
-        if parent.text == first_text:
+        if not first_text.is_tail:
             location = 'text'
         else:
             location = 'tail'
@@ -2646,23 +2639,6 @@ class EPUBCreatorLxml(QThread):
             self._append_text_to_element(parent, reserve_html)
             logger.warning(f"   ⚠️ Reserve element inserted as TEXT (will appear escaped in output)")
 
-    def _color_element_tree(self, element, color):
-        style = element.get('style', '')
-        if style:
-            element.set('style', f"{style}; color:{color}")
-        else:
-            element.set('style', f"color:{color}")
-
-        for child in element.iter():
-            if child is element:
-                continue
-
-            style = child.get('style', '')
-            if style:
-                child.set('style', f"{style}; color:{color}")
-            else:
-                child.set('style', f"color:{color}")
-
     def _restore_reserved_elements(self, translation, para):
         result = translation
 
@@ -2743,19 +2719,18 @@ class EPUBCreatorLxml(QThread):
             result
         )
 
-        return result
+        result = re.sub(r'\s+(</[a-zA-Z0-9_]+>)', r'\1 ', result)
 
-    def _should_preserve_link_structure(self, element):
-        return False
+        result = re.sub(r'(</[a-zA-Z0-9_]+>)([^\s<.,:;!?\-\)\]}])', r'\1 \2', result)
 
-    def _create_translation_preserving_links(self, original_element, translation_text, root):
-        pass
+        result = re.sub(r'([^\s>(\[{])(<[a-zA-Z0-9_]+/>)', r'\1 \2', result)
 
-    def _insert_by_position(self, original, translation, element_name, root):
-        pass
+        result = re.sub(r'(<[a-zA-Z0-9_]+/>)([^\s<.,:;!?\-\)\]}])', r'\1 \2', result)
 
-    def _insert_inline_translation(self, original, translation, parent, root):
-        pass
+        result = re.sub(r'\s+([.,!?;:])', r'\1', result)
 
-    def _create_side_by_side_table(self, original, translation, root):
-        pass
+        result = re.sub(r'([.,!?;:])([^\s])', r'\1 \2', result)
+
+        result = re.sub(r'\s{2,}', ' ', result)
+
+        return result.strip()
