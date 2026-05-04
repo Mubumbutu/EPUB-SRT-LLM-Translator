@@ -1,6 +1,6 @@
-# EPUB and SRT Translator with LLM
+# EPUB / SRT / TXT / PDF / Kindle / FB2 / DOCX Translator with LLM
 
-A desktop application for translating **EPUB**, **SRT**, and **TXT** files using local or cloud-hosted language models.
+A desktop application for translating **EPUB**, **SRT**, **TXT**, **PDF**, **MOBI/AZW/AZW3**, **FB2**, and **DOCX** files using local or cloud-hosted language models.
 
 <img width="1502" height="850" alt="tar" src="https://github.com/user-attachments/assets/e367cca8-55c1-4fa4-ae2d-05d3ab494323" />
 
@@ -21,19 +21,21 @@ A desktop application for translating **EPUB**, **SRT**, and **TXT** files using
 <img width="728" height="806" alt="zielo_en" src="https://github.com/user-attachments/assets/8c1f3ff2-a305-4188-a955-e68fafe4ab8d" />
 <img width="729" height="806" alt="zielo_es" src="https://github.com/user-attachments/assets/687303ad-b221-4610-abad-f54fab012755" />
 
-
-
 </details>
 
 ---
 
 ## Supported formats
 
-| Format | Notes |
-|--------|-------|
-| EPUB | Full HTML structure preserved; two processing modes (see below) |
-| SRT | Subtitle blocks with timestamps; translated lines are split proportionally to match original line count |
-| TXT | Plain text, paragraph-by-paragraph |
+| Format | Extensions | Notes |
+|--------|------------|-------|
+| EPUB | `.epub` | Full HTML structure preserved; two processing modes (see below) |
+| SRT | `.srt` | Subtitle blocks with timestamps; translated lines split proportionally |
+| TXT | `.txt` | Plain text, paragraph-by-paragraph |
+| PDF | `.pdf` | Text extracted by page block; layout preserved on PDF→PDF save |
+| Kindle | `.mobi` `.azw` `.azw3` | Extracted internally; AZW3 unpacked as EPUB structure |
+| FictionBook | `.fb2` | XML-based; sections, titles, paragraphs and epigraphs preserved |
+| Word | `.docx` | Heading styles detected automatically (`Heading 1`, `Heading 2`, etc.) |
 
 ---
 
@@ -46,6 +48,35 @@ A desktop application for translating **EPUB**, **SRT**, and **TXT** files using
 | OpenRouter | Cloud API | Requires API key and model name (e.g. `openai/gpt-4o`, `openai/gpt-4o:free`) |
 
 OpenRouter requests include automatic rate-limit detection and retry with backoff.
+
+---
+
+## JSON Payload mode
+
+For models or endpoints that require a custom JSON input format (e.g. local inference servers with non-standard APIs), the prompt editor can be switched to **JSON Payload mode**. In this mode the entire request body is defined as a raw JSON template instead of role-based chat messages.
+
+Available template variables:
+
+| Variable | Description |
+|----------|-------------|
+| `{core_text}` | The text to translate |
+| `{context_before}` | Previous paragraphs (read-only context) |
+| `{context_after}` | Following paragraphs (read-only context) |
+
+`temperature` is injected automatically from the UI slider and must not be included in the template.
+
+The **Response field** setting (dot-notation path) tells the application where to find the translation in the server's response. Leave it empty for auto-detection of common keys (`translation`, `text`, `result`, `output`, `translated`).
+
+Examples:
+
+| Response field | Matches |
+|----------------|---------|
+| *(empty)* | Auto-detect common keys |
+| `translation` | `{"translation": "..."}` |
+| `choices.0.message.content` | Standard OpenAI-style chat response |
+| `choices.0.message.content.translation` | JSON string nested inside `content` |
+
+---
 
 **Quick translation** (no LLM required):
 
@@ -91,11 +122,6 @@ Multi-paragraph elements can optionally preserve their internal paragraph breaks
 
 When disabled, all newlines within a fragment are flattened before sending.
 
-### Special cases handled on save
-
-- **Drop cap spans** (`span.first-letter`) — the first character is separated from the rest of the element text and wrapped in the correct span after translation.
-- **Last-word spans** (`span.last-word`) — the last word is kept in its span after the translated text is inserted.
-
 ---
 
 ## Tag alignment (EPUB Legacy mode)
@@ -114,6 +140,21 @@ When saving an EPUB translated in Legacy mode, the application can run a multili
 Models are stored in `<app_directory>/models/<model_name>/`. Each model has its own subfolder; changing the model name does not overwrite previously downloaded models. CUDA is supported.
 
 The alignment step runs after translation, as a batch process at save time. Paragraphs without inline tags and those containing reserve elements are skipped automatically.
+
+### Alignment quality indicators
+
+Each translated fragment in Legacy mode displays a coloured dot showing its alignment status:
+
+| Dot | Meaning |
+|-----|---------|
+| ○ | Not yet aligned (plain text will be saved) |
+| 🟢 | Auto-wrap applied, or manually confirmed as correct |
+| 🟡 | Neural model aligned — probably OK (0–1 corrections) |
+| 🟠 | Neural model aligned — worth checking (2+ corrections) |
+| ⚫ | No inline tags in original — alignment not applicable |
+| 🔴 | Manually flagged as bad — always excluded from save |
+
+When saving a Legacy-mode EPUB that contains aligned fragments, a dialog lets you choose which quality levels to include. Fragments whose dot is not selected are saved with plain translated text instead of aligned HTML.
 
 ---
 
@@ -160,9 +201,11 @@ The application maintains separate prompt variants for each file type and proces
 | Variant | Used for |
 |---------|----------|
 | `epub_inline` | EPUB in Inline mode |
-| `epub_legacy` | EPUB in Legacy mode |
+| `epub_legacy` | EPUB in Legacy mode, AZW3 |
 | `srt` | SRT files |
-| `txt` | TXT files |
+| `txt` | TXT, PDF, FB2, DOCX, MOBI |
+
+The variant is selected automatically based on the file type and, for Kindle files, on what was found inside the archive after extraction. AZW3 files unpack internally as an EPUB structure and are processed in Legacy mode — reserve element placeholders (`<id_xx>`) may be present, so they use `epub_legacy`. Plain MOBI files unpack as HTML and are processed as plain text with no placeholders, so they use `txt`. PDF, FB2 and DOCX processors also extract plain text only. Writers restore non-image reserve elements (`<br>`, `<code>`, etc.) where the output format supports them, and silently drop image placeholders since the new file has no embedded image resources.
 
 For LM Studio and OpenRouter, prompts are split into **System**, **Assistant (context/instruction)**, and **User** roles.  
 For Ollama, a single combined prompt is used.
@@ -183,6 +226,20 @@ Context is provided as read-only reference — only the current fragment is tran
 
 ---
 
+## Sentence batching
+
+Multiple fragments can be combined into a single LLM request to reduce API call overhead and speed up translation. Fragments are joined with a `<z>` separator marker; the model is instructed to preserve all markers and return the same number of segments. The response is then split back and mapped to the original fragments.
+
+- **Batch size:** 2–20 fragments per request (default: 5)
+- Works in both **Inline** and **Legacy** mode
+- Fragments from different chapters are never merged into the same batch
+- Available for EPUB files only (disabled automatically for other formats)
+- When batching is active, the context window controls are hidden — context is implicit within the batch
+
+If the model returns a wrong number of `<z>` separators, the batch is rejected and the fragments are retried individually.
+
+---
+
 ## Session management
 
 The current translation state can be saved to a JSON file and restored later. The session includes:
@@ -190,7 +247,7 @@ The current translation state can be saved to a JSON file and restored later. Th
 - Translation settings (temperature, context window, processing mode, prompt variant)
 - Custom prompts
 
-On load, the application re-parses the original file to reconstruct the internal EPUB book object (required for saving) and remaps paragraph IDs by matching normalized original text.
+On load, the application re-parses the original file to reconstruct the internal book object (required for saving) and remaps paragraph IDs by matching normalized original text.
 
 Sessions are stored as plain JSON and are not tied to a specific file path — the original file location is confirmed on load via a file picker.
 
@@ -202,18 +259,16 @@ Sessions are stored as plain JSON and are not tied to a specific file path — t
 
 ```
 PyQt6
-requests
+PyQt6-WebEngine
 lxml
 ebooklib
+requests
 deep-translator
 deepl
 openrouter
-```
-
-Optional — required only for tag alignment in EPUB Legacy mode:
-```
-transformers
-torch
+PyMuPDF
+mobi
+python-docx
 ```
 
 ---
@@ -310,19 +365,44 @@ Make sure your chosen LLM backend (LM Studio / Ollama) is running before startin
 
 ---
 
+## Preview and reader
+
+### Inline preview (EPUB)
+
+The main window displays an inline HTML preview of the currently selected EPUB fragment, rendered with the actual EPUB stylesheet. Translated paragraphs are injected live into the preview — no save required. Clicking a paragraph in the preview selects the corresponding fragment in the list. Right-clicking opens a context menu with quick actions (re-translate, mark as correct, etc.).
+
+The preview toolbar provides:
+- **Refresh** — regenerate preview for the current fragment
+- **Chapter navigation** — jump to previous / next chapter
+- **Dark mode toggle** — switches the preview to dark background
+
+### Full-screen reader
+
+A separate full-screen reader window can be opened from the preview toolbar. The reader opens modeless alongside the main application — translations are pushed in live as they complete without interrupting reading.
+
+**EPUB reader** features:
+- Chapter navigation with `←` / `→` keys or on-screen arrows
+- Dark mode and sepia mode
+- Drag-to-scroll
+- Status bar showing translated / total fragment count for the current chapter
+
+**Generic reader** (FB2, DOCX, MOBI, PDF) works identically to the EPUB reader but uses format-specific rendering engines.
+
+---
+
 ## Workflow
 
 ```
 Open file → Select fragments → Configure LLM → Translate → Review → Save file
 ```
 
-1. **Open file** — EPUB, SRT, or TXT via `📂 Open File`.
+1. **Open file** — EPUB, SRT, TXT, PDF, MOBI/AZW, FB2 or DOCX via `📂 Open File`.
 2. **Options tab** — select backend, enter API keys or model name, click **Save Settings**.
 3. **Select fragments** — checkboxes in the list; `Select All`, `Select Untranslated`, `Select Mismatch`, or Shift+click for range selection. Searchable by original or translated text.
 4. **Translate** — `▶ Translate Selected`. Status bar shows fragment index, progress count, elapsed time, timeout, and auto-fix attempt number.
 5. **Review** — click a fragment to see original and translation side by side. The translation panel is editable; changes are applied immediately.
 6. **Handle mismatches** — red fragments have detected problems. Hover for details. Options: edit manually, re-translate, mark as correct (ignore), or flag for review.
-7. **Save** — `💾 Save as New File`. For EPUB Legacy with translations, a dialog offers to run tag alignment before saving.
+7. **Save** — `💾 Save as New File`. A dialog lets you choose the output format. For EPUB Legacy with translations, an additional dialog offers to run tag alignment before saving.
 
 ---
 
@@ -332,6 +412,10 @@ Open file → Select fragments → Configure LLM → Translate → Review → Sa
 - **Alignment and VRAM** — the alignment model loads into the same GPU as the LLM. Shut down LM Studio or Ollama before running alignment to avoid out-of-memory errors.
 - **Switching Inline ↔ Legacy** — if a file is already loaded, the mode change dialog offers to reload immediately. Translating without reloading uses the new prompts but the old placeholder structure.
 - **Ruby annotations** — `<rt>` and `<rp>` tags (Japanese furigana) are stripped during EPUB parsing and not included in fragments.
+- **MOBI/AZW write** — saving back to MOBI or AZW format is not supported. Amazon has not published a write specification; use EPUB as the output format for Kindle content.
+- **KFX** — Kindle Format 10 is not supported. It requires Calibre, which is not a dependency of this application.
+- **PDF with DRM** — encrypted PDFs cannot be processed. Remove DRM before opening.
+- **FB2 compressed** — gzip-compressed `.fb2.zip` files are not supported directly; extract the `.fb2` file first.
 
 ---
 
