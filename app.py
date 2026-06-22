@@ -708,6 +708,7 @@ class TranslatorApp(QMainWindow):
         self.pdf_creator = None
 
         self._hard_cancel_mode: bool = False
+        self._auto_save_counter: int = 0
 
         self._download_done_signal.connect(self._on_download_done_slot)
         self._preview_engine = EPUBPreviewEngine()
@@ -2050,7 +2051,7 @@ class TranslatorApp(QMainWindow):
         self.ollama_model_edit.setPlaceholderText("e.g., llama3.2:3b")
         self.ollama_model_edit.setStyleSheet(INPUT_STYLE)
         engine_form.addRow(self.ollama_model_label, self.ollama_model_edit)
-        
+
         self.ollama_server_url_label = form_label("Ollama Server URL:")
         self.ollama_server_url_edit = QLineEdit()
         self.ollama_server_url_edit.setPlaceholderText("e.g., http://localhost:11434")
@@ -2732,6 +2733,46 @@ class TranslatorApp(QMainWindow):
             lambda _: _sync_inline_dependent_mismatch_visibility()
         )
 
+        autosave_content = QWidget()
+        autosave_content.setStyleSheet("background: transparent;")
+        autosave_layout = QVBoxLayout(autosave_content)
+        autosave_layout.setContentsMargins(0, 0, 0, 0)
+        autosave_layout.setSpacing(8)
+
+        autosave_desc = QLabel(
+            "Save the auto-save session (.json) every N correctly translated fragments (no mismatch).\n"
+            "Set to 1 to save after every correct translation. Higher values reduce save frequency."
+        )
+        autosave_desc.setWordWrap(True)
+        autosave_desc.setStyleSheet("color: #888888; font-size: 11px;")
+        autosave_layout.addWidget(autosave_desc)
+
+        autosave_row = QHBoxLayout()
+        autosave_row.setSpacing(8)
+        autosave_interval_label = QLabel("Save every N correct translations:")
+        autosave_interval_label.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+        autosave_row.addWidget(autosave_interval_label)
+
+        self.auto_save_interval_spinbox = QSpinBox()
+        self.auto_save_interval_spinbox.setRange(1, 100)
+        self.auto_save_interval_spinbox.setSingleStep(1)
+        self.auto_save_interval_spinbox.setValue(self.app_settings.get('auto_save_interval', 1))
+        self.auto_save_interval_spinbox.setFixedWidth(74)
+        self.auto_save_interval_spinbox.setStyleSheet(SPINBOX_STYLE)
+        self.auto_save_interval_spinbox.setToolTip(
+            "Auto-save session every N correctly translated fragments.\n"
+            "1 = save after every correct translation (default).\n"
+            "Higher values reduce save frequency."
+        )
+        autosave_row.addWidget(self.auto_save_interval_spinbox)
+        autosave_row.addStretch()
+        autosave_layout.addLayout(autosave_row)
+
+        outer_layout.addWidget(
+            make_collapsible("💾  Auto-save Session Interval", autosave_content,
+                             expanded=False, color_scheme="default")
+        )
+
         outer_layout.addStretch()
 
         btn_save_options = QPushButton("  Save Settings")
@@ -2785,6 +2826,7 @@ class TranslatorApp(QMainWindow):
             return
 
         self.is_session_loaded = False
+        self._auto_save_counter = 0
         p = path.lower()
 
         if p.endswith('.epub'):
@@ -3365,6 +3407,12 @@ class TranslatorApp(QMainWindow):
         if not self.original_file_path:
             return
 
+        interval = self.app_settings.get('auto_save_interval', 1)
+        self._auto_save_counter += 1
+        if self._auto_save_counter < interval:
+            return
+        self._auto_save_counter = 0
+
         try:
             base_name = os.path.splitext(os.path.basename(self.original_file_path))[0]
             session_dir = os.path.join("session", base_name)
@@ -3467,6 +3515,7 @@ class TranslatorApp(QMainWindow):
             self.paragraphs = session_data['paragraphs']
             self.original_file_path = confirmed_path
             self.is_session_loaded = True
+            self._auto_save_counter = 0
 
             metadata = session_data.get('metadata', {})
             processing_mode = metadata.get('processing_mode', 'inline')
@@ -7292,6 +7341,7 @@ class TranslatorApp(QMainWindow):
             old_quote_style = self.app_settings.get('quote_style', 'neutral')
             new_quote_style = self.quote_style_combo.currentData()
             settings["quote_style"] = new_quote_style
+            settings["auto_save_interval"] = self.auto_save_interval_spinbox.value()
             for obsolete in ("use_ps_markers", "restore_paragraph_epub", "restore_paragraph_txt",
                              "use_source_quote_style"):
                 settings.pop(obsolete, None)
