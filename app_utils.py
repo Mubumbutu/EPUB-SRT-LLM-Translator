@@ -259,6 +259,7 @@ class AppSettingsManager:
         "show_ps_in_ui": False,
         "quote_style": "neutral",
         "skip_inline_tags": {},
+        "auto_save_interval": 1,
         "mismatch_checks": {
             "paragraphs": True,
             "first_char": True,
