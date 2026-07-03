@@ -146,6 +146,7 @@ class LMStudioClient(LLMClient):
 
     def _stream_response(self, session, payload, headers, timeout_seconds):
         chunks = []
+        start_time = time.monotonic()
         response = session.post(
             self.endpoint,
             json=payload,
@@ -164,6 +165,11 @@ class LMStudioClient(LLMClient):
                     logger.info("LMStudioClient: abort detected mid-stream")
                     response.close()
                     raise requests.RequestException("Aborted by user")
+
+                if time.monotonic() - start_time > timeout_seconds:
+                    logger.error(f"LMStudioClient: total stream duration exceeded {timeout_seconds}s")
+                    response.close()
+                    raise requests.Timeout(f"Streaming exceeded total timeout of {timeout_seconds}s")
 
                 if not line:
                     continue
@@ -190,162 +196,121 @@ class LMStudioClient(LLMClient):
 
     def translate(
         self,
-        prompt,
+        prompt: List[Dict],
         temperature: float,
         timeout_seconds: int,
         top_p: Optional[float] = None,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        max_retries: int = 5
     ) -> str:
-        self._abort_event.clear()
-        headers = {"Content-Type": "application/json"}
+        for attempt in range(1, max_retries + 1):
+            self._wait_for_rate_limit()
 
-        session = requests.Session()
-        with self._session_lock:
-            self._active_session = session
+            self._last_request_time = time.time()
 
-        try:
-            if isinstance(prompt, dict) and "__json_payload__" in prompt:
-                payload = prompt["__json_payload__"]
-                response_field = prompt.get("__response_field__", "").strip()
-                payload["temperature"] = temperature
-                if top_p is not None:
-                    payload["top_p"] = top_p
-                if top_k is not None:
-                    payload["top_k"] = top_k
-                payload["stream"] = False
-
-                logger.debug(f"JSON payload request: timeout={timeout_seconds}s, response_field='{response_field}'")
-
-                response = session.post(
-                    self.endpoint,
-                    json=payload,
-                    headers=headers,
-                    timeout=timeout_seconds,
-                    stream=True
+            try:
+                logger.debug(
+                    f"OpenRouter SDK request (attempt {attempt}/{max_retries}): "
+                    f"model={self.model_name}, temp={temperature}, "
+                    f"timeout={timeout_seconds}s, free={self.is_free_model}"
                 )
-                response.raise_for_status()
 
-                with self._session_lock:
-                    self._active_response = response
-
-                try:
-                    if self._abort_event.is_set():
-                        raise requests.RequestException("Aborted by user")
-                    data = response.json()
-                finally:
-                    with self._session_lock:
-                        if self._active_response is response:
-                            self._active_response = None
-
-                if response_field:
-                    try:
-                        parts = response_field.split(".")
-                        val = data
-                        for part in parts:
-                            if isinstance(val, str):
-                                try:
-                                    val = json.loads(val)
-                                except (json.JSONDecodeError, ValueError):
-                                    pass
-                            if isinstance(val, list):
-                                val = val[int(part)]
-                            else:
-                                val = val[part]
-                        if isinstance(val, str):
-                            content = val.strip()
-                        else:
-                            content = json.dumps(val, ensure_ascii=False).strip()
-                    except (KeyError, IndexError, ValueError, TypeError) as e:
-                        raw = json.dumps(data)[:400]
-                        raise ValueError(
-                            f"Could not extract field '{response_field}' from server response.\n"
-                            f"Check the 'Response field' setting.\n"
-                            f"Raw response: {raw}"
-                        )
-                else:
-                    choices = data.get("choices", [])
-                    if choices:
-                        raw_content = choices[0].get("message", {}).get("content", "")
-                    else:
-                        raw_content = (
-                            data.get("response", "")
-                            or data.get("translation", "")
-                            or data.get("text", "")
-                        )
-
-                    if raw_content:
-                        stripped = raw_content.strip()
-                        if stripped.startswith("{") and stripped.endswith("}"):
-                            try:
-                                parsed = json.loads(stripped)
-                                translation_keys = [
-                                    "translation", "Translation", "TRANSLATION",
-                                    "text", "Text", "result", "Result",
-                                    "output", "Output", "translated", "Translated"
-                                ]
-                                extracted = None
-                                for k in translation_keys:
-                                    if k in parsed:
-                                        extracted = str(parsed[k]).strip()
-                                        break
-                                content = extracted if extracted else stripped
-                            except (json.JSONDecodeError, ValueError):
-                                content = stripped
-                        else:
-                            content = stripped
-                    else:
-                        content = ""
-
-                if not content:
-                    raw = json.dumps(data)[:400]
-                    raise ValueError(
-                        f"Server returned 200 OK but the extracted content is empty.\n"
-                        f"Check the 'Response field' setting or verify the model output format.\n"
-                        f"Raw response: {raw}"
-                    )
-
-                logger.debug(f"JSON payload response: {len(content)} chars")
-                return content
-
-            else:
-                payload = {
-                    "messages": prompt,
-                    "temperature": temperature,
-                    "max_tokens": -1,
-                    "stream": True
-                }
+                extra_params = {}
                 if top_p is not None:
-                    payload["top_p"] = top_p
+                    extra_params["top_p"] = top_p
                 if top_k is not None:
-                    payload["top_k"] = top_k
+                    extra_params["top_k"] = top_k
 
-                logger.debug(f"LM Studio streaming request: temp={temperature}, timeout={timeout_seconds}s")
-
-                content = self._stream_response(session, payload, headers, timeout_seconds)
-
-                if not content:
-                    raise ValueError(
-                        "Server returned 200 OK but 'content' is empty.\n"
-                        "Make sure the model is fully loaded and supports the chat/completions format."
+                with OpenRouter(api_key=self.api_key) as client:
+                    response = client.chat.send(
+                        model=self.model_name,
+                        messages=prompt,
+                        temperature=temperature,
+                        timeout_ms=int(timeout_seconds * 1000),
+                        **extra_params
                     )
 
-                logger.debug(f"LM Studio response: {len(content)} chars")
+                if not response.choices:
+                    logger.warning("OpenRouter returned no choices")
+                    return ""
+
+                content = response.choices[0].message.content
+
+                if not content:
+                    logger.warning("OpenRouter returned empty content")
+                    return ""
+
+                logger.debug(f"OpenRouter response: {len(content)} chars")
                 return content
 
-        except requests.Timeout:
-            logger.error(f"LM Studio timeout after {timeout_seconds}s")
-            raise TimeoutError(f"LM Studio request timed out after {timeout_seconds}s")
+            except Exception as e:
+                err_str = str(e)
 
-        except requests.RequestException as e:
-            if self._abort_event.is_set():
-                raise
-            logger.error(f"LM Studio request failed: {e}")
-            raise
+                if self._is_rate_limit_error(e):
+                    self._last_request_time = time.time()
 
-        finally:
-            with self._session_lock:
-                if self._active_session is session:
-                    self._active_session = None
+                    wait_seconds = min(10.0 * attempt, 120.0)
+
+                    if attempt < max_retries:
+                        logger.warning(
+                            f"[OpenRouter] Rate limited 429 "
+                            f"(attempt {attempt}/{max_retries}). "
+                            f"Waiting {wait_seconds:.0f}s before retry..."
+                        )
+                        time.sleep(wait_seconds)
+                        continue
+                    else:
+                        logger.error(
+                            f"[OpenRouter] Rate limited - "
+                            f"max retries ({max_retries}) reached. Giving up."
+                        )
+                        raise Exception(
+                            f"OpenRouter rate limit exceeded after {max_retries} attempts"
+                        )
+
+                is_timeout = (
+                    "timeout" in err_str.lower()
+                    or "timed out" in err_str.lower()
+                )
+
+                if is_timeout:
+                    logger.error(f"OpenRouter timeout after {timeout_seconds}s")
+                    raise TimeoutError(
+                        f"OpenRouter request timed out after {timeout_seconds}s"
+                    )
+
+                is_not_found = (
+                    "404" in err_str
+                    or "not found" in err_str.lower()
+                    or ("model" in err_str.lower() and "not" in err_str.lower())
+                )
+
+                if is_not_found:
+                    raise Exception(
+                        f"OpenRouter model not found: '{self.model_name}'\n"
+                        f"Check the model name at openrouter.ai/models\n"
+                        f"Details: {err_str}"
+                    )
+
+                is_auth_error = (
+                    "401" in err_str
+                    or "403" in err_str
+                    or "unauthorized" in err_str.lower()
+                    or "forbidden" in err_str.lower()
+                    or "invalid api key" in err_str.lower()
+                )
+
+                if is_auth_error:
+                    raise Exception(
+                        f"OpenRouter authentication error.\n"
+                        f"Check your API key in Options tab.\n"
+                        f"Details: {err_str}"
+                    )
+
+                logger.error(f"OpenRouter request failed: {err_str}")
+                raise Exception(f"OpenRouter error: {err_str}")
+
+        raise Exception(f"OpenRouter: all {max_retries} attempts failed")
                 
 class OllamaClient(LLMClient):
     def __init__(
