@@ -677,6 +677,7 @@ class TranslatorApp(QMainWindow):
         self.para_to_row_map = {}
         self.row_to_para_map = {}
         self.original_file_path: Optional[str] = None
+        self.session_file_path: Optional[str] = None
         self.file_type: Optional[str] = None
         self.source_format: Optional[str] = None
         self.app_settings = AppSettingsManager.load_settings()
@@ -2523,6 +2524,19 @@ class TranslatorApp(QMainWindow):
         epub_outer_layout.setContentsMargins(0, 0, 0, 0)
         epub_outer_layout.setSpacing(10)
 
+        self.auto_save_progress = QCheckBox("Auto save progress to JSON")
+        self.auto_save_progress.setStyleSheet(CHECKBOX_STYLE)
+        self.auto_save_progress.setToolTip(
+            "<html>"
+            "Save the progress to the last used JSON file every 100 successful translations"
+            "</html>"
+        )
+        self.auto_save_progress.setChecked(self.app_settings.get('auto_save_progress', True))
+        self.auto_save_progress.setEnabled(True)
+        self.auto_save_progress.stateChanged.connect(self._toggle_auto_save)
+        epub_outer_layout.addWidget(self.auto_save_progress)
+
+        
         self.inline_formatting_checkbox = QCheckBox("Use inline formatting system  (Inline mode)")
         self.inline_formatting_checkbox.setStyleSheet(CHECKBOX_STYLE)
         self.inline_formatting_checkbox.setToolTip(
@@ -3324,15 +3338,7 @@ class TranslatorApp(QMainWindow):
         self.statusBar().showMessage("File unloaded", 3000)
         logging.info("File unloaded - application state cleared")
 
-    def save_session(self):
-        if not self.paragraphs:
-            self.show_message("No Data", "No progress to save.", QMessageBox.Icon.Warning)
-            return
-
-        path, _ = QFileDialog.getSaveFileName(self, "Save Session", "", "JSON Files (*.json)")
-        if not path:
-            return
-
+    def _save_session(self, path):
         try:
             variant = self._get_current_variant()
 
@@ -3395,11 +3401,11 @@ class TranslatorApp(QMainWindow):
                 quick_translate_service=quick_translate_service
             )
 
-            self.show_message("Success", f"Session saved to file:\n{path}")
-
+            return True
+            
         except Exception as e:
             logging.error(f"Failed to save session: {e}")
-            self.show_message("Session Save Error", f"Failed to save session:\n{e}", QMessageBox.Icon.Critical)
+            return False
 
     def _auto_save_session(self):
         if not self.paragraphs:
@@ -3483,6 +3489,21 @@ class TranslatorApp(QMainWindow):
         except Exception as e:
             logging.error(f"Auto-save session failed: {e}")
 
+    def save_session(self):
+        if not self.paragraphs:
+            self.show_message("No Data", "No progress to save.", QMessageBox.Icon.Warning)
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Save Session", "", "JSON Files (*.json)")
+        if not path:
+            return
+        
+        if self._save_session(path):
+            self.session_file_path = path
+            self.show_message("Success", f"Session saved to file:\n{path}")
+        else:
+            self.show_message("Session Save Error", f"Failed to save session:\n{e}", QMessageBox.Icon.Critical)
+            
     def load_session(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load Session", "", "JSON Files (*.json)")
         if not path:
@@ -5999,6 +6020,14 @@ class TranslatorApp(QMainWindow):
 
     def _update_progress(self):
         self.completed_translations += 1
+        save_progress = self.app_settings.get("auto_save_progress", False) 
+        if ((self.completed_translations % 100) == 0
+            and save_progress
+            and bool(self.session_file_path)):
+            # It's time to automatically save the file here
+            self._save_session(self.session_file_path)
+            logger.info(f"Saved session after {self.completed_translations} to {self.session_file_path}")
+        
         percent = int(self.completed_translations / self.total_to_translate * 100)
         self.progress_bar.setValue(percent)
 
@@ -7494,6 +7523,10 @@ class TranslatorApp(QMainWindow):
         is_json = self.json_payload_checkbox.isChecked()
         self.single_prompt_checkbox.setVisible(has_file and not is_ollama and not is_json)
 
+    def _toggle_auto_save(self, checked):
+        self.app_settings['auto_save_progress'] = checked
+        
+        
     def _toggle_processing_mode(self, checked):
         new_mode = 'inline' if checked else 'legacy'
 

@@ -254,6 +254,7 @@ class AppSettingsManager:
         "ollama_endpoint": "http://localhost:11434",
         "deepl_free_api_key": "",
         "deepl_pro_api_key": "",
+        "auto_save_progress": False,
         "use_inline_formatting": True,
         "restore_paragraph_structure": True,
         "show_ps_in_ui": False,
